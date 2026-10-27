@@ -1,0 +1,14 @@
+{
+  "name": "unbloat",
+  "owner": {
+    "name": "workflowsdiy"
+  },
+  "description": "unbloat: clean up what your coding agent left behind, and keep it from coming back.",
+  "plugins": [
+    {
+      "name": "unbloat",
+      "source": "./",
+      "description": "Clean up what your coding agent left behind (dead code, stale docs, bloated agent instructions, plans and reports) and keep it from coming back with a pre-commit gate, a write guard and an end-of-turn gate."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 40 1440 300" role="img" aria-labelledby="t d">
+  <title id="t">unbloat</title>
+  <desc id="d">Clean up what your coding agent left behind, and keep it from coming back.</desc>
+  <style>
+    .word { fill: #12201c; font: 700 132px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: -4px; }
+    .tag { fill: #4b5a55; font: 400 38px system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    </style>
+  <rect x="80" y="70" width="220" height="220" rx="50" fill="#0F6E56"/>
+  <rect x="122" y="118" width="136" height="20" rx="10" fill="#fff" fill-opacity="0.35"/>
+  <rect x="122" y="156" width="114" height="20" rx="10" fill="#fff" fill-opacity="0.55"/>
+  <rect x="122" y="194" width="92" height="20" rx="10" fill="#fff" fill-opacity="0.78"/>
+  <rect x="122" y="232" width="66" height="20" rx="10" fill="#fff"/>
+  <text x="350" y="200" class="word">unbloat</text>
+  <text x="356" y="262" class="tag">Clean up what your coding agent left behind,</text>
+  <text x="356" y="310" class="tag">and keep it from coming back.</text>
+</svg>

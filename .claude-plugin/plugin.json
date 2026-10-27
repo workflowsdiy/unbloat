@@ -1,0 +1,22 @@
+{
+  "name": "unbloat",
+  "version": "0.1.0",
+  "description": "Clean up what your coding agent left behind (dead code, stale docs, bloated agent instructions, plans and reports) and keep it from coming back with a pre-commit gate, a write guard and an end-of-turn gate.",
+  "icon": ".claude-plugin/icon.png",
+  "author": {
+    "name": "workflowsdiy"
+  },
+  "homepage": "https://github.com/workflowsdiy/unbloat",
+  "repository": "https://github.com/workflowsdiy/unbloat",
+  "license": "MIT",
+  "keywords": [
+    "cleanup",
+    "dead-code",
+    "refactoring",
+    "documentation",
+    "agent-instructions",
+    "context-engineering",
+    "ai-slop",
+    "lean"
+  ]
+}

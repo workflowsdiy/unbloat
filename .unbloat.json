@@ -1,0 +1,31 @@
+{
+  "allow": [],
+  "allowPhrases": [
+    {
+      "pattern": "PLAN\\.md|HANDOFF\\.md|184 tests|round 3|after the review|second reviewers|review rounds|first slice|the user approved",
+      "paths": [
+        "skills/unbloat/references/catalog.md",
+        "skills/unbloat/references/check.md",
+        "README.md"
+      ],
+      "reason": "examples quoted to show what counts as bloat"
+    }
+  ],
+  "skip": [
+    {
+      "path": "skills/unbloat/scripts/unbloat-check.mjs",
+      "reason": "the check's own patterns"
+    },
+    {
+      "path": "test/**",
+      "reason": "fixtures that must trip the check"
+    }
+  ],
+  "dupSkip": [],
+  "allowLarge": [],
+  "keep": [],
+  "budgets": {
+    "docs": 436,
+    "instructions": 95
+  }
+}

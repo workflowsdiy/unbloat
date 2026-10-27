@@ -1,0 +1,529 @@
+// node --test: unbloat-check against throwaway git repositories.
+import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { after, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'unbloat', 'scripts', 'unbloat-check.mjs');
+const check = (cwd, args = [], input) => spawnSync(process.execPath, [SCRIPT, ...args], { cwd, input, encoding: 'utf8' });
+const git = (cwd, ...args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+
+// Every temporary folder the suite makes is removed when it ends.
+const temps = [];
+const temp = prefix => { const dir = mkdtempSync(join(tmpdir(), prefix)); temps.push(dir); return dir; };
+after(() => { for (const dir of temps) rmSync(dir, { recursive: true, force: true }); });
+
+function repo(files, config = { budgets: {} }, name = '.unbloat.json') {
+  const dir = temp('unbloat-check-');
+  git(dir, 'init', '-q');
+  git(dir, 'config', 'user.email', 'test@example.com');
+  git(dir, 'config', 'user.name', 'test');
+  git(dir, 'config', 'core.excludesFile', join(dir, '.git', 'no-global-excludes')); // the machine's ignores don't apply
+  git(dir, 'config', 'core.hooksPath', join(dir, '.git', 'hooks')); // nor its hooks folder or signing
+  git(dir, 'config', 'commit.gpgsign', 'false');
+  for (const [path, text] of Object.entries({ ...files, [name]: JSON.stringify(config) })) {
+    mkdirSync(dirname(join(dir, path)), { recursive: true });
+    writeFileSync(join(dir, path), text);
+  }
+  git(dir, 'add', '-A');
+  return dir;
+}
+
+test('a clean repository passes', () => {
+  const r = check(repo({ 'README.md': '# Tool\n\nIt renders pages.\n', 'src/a.js': 'export const a = 1;\n' }));
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('process docs always fail; other process and run-record names pass only when allowed with a reason', () => {
+  const dir = repo({ 'PLAN.md': 'x\n', 'evidence/run.json': '{}\n', 'notes/review-3.md': 'x\n', 'build.log': 'x\n', 'reports/a.json': '{}\n', 'RESULTS.md': 'x\n' });
+  const r = check(dir);
+  assert.equal(r.status, 1);
+  for (const p of ['PLAN.md', 'evidence/run.json']) assert.match(r.stderr, new RegExp(`^${p}: process file`, 'm'));
+  for (const p of ['notes/review-3.md', 'build.log', 'reports/a.json', 'RESULTS.md']) assert.match(r.stderr, new RegExp(`^${p}: run record`, 'm'));
+  const why = 'product file';
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ allow: ['evidence/**', 'PLAN.md', 'notes/**', '*.log', 'reports/**', 'RESULTS.md'].map(path => ({ path, reason: why })) }));
+  const after = check(dir);
+  assert.equal(after.status, 1);
+  assert.match(after.stderr, /^PLAN\.md: process file/m); // a process doc: no exception keeps it
+  assert.doesNotMatch(after.stderr, /evidence\/run\.json|build\.log|RESULTS\.md|reports\/a\.json|review-3/);
+});
+
+test('source code in an evidence/ or reviews/ package is product; its other files are process', () => {
+  const r = check(repo({ 'src/app/evidence/pack.py': 'x = 1\n', 'src/app/reviews/score.ts': 'export {};\n', 'src/app/evidence/run.json': '{}\n' }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^src\/app\/evidence\/run\.json: process file/m);
+  assert.doesNotMatch(r.stderr, /pack\.py|score\.ts/);
+});
+
+test('every exception needs a reason, and a plain run lists them', () => {
+  const dir = repo({ 'build.log': 'x\n' }, { allow: ['build.log'] });
+  assert.match(check(dir).stderr, /allow\[0\] must be \{ "path": \.\.\., "reason": \.\.\. \}/);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ allow: [{ path: 'build.log', reason: ' ' }] }));
+  assert.match(check(dir).stderr, /allow\[0\] \(build\.log\) needs a "reason"/);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ allow: [{ path: 'build.log', reason: 'the build tool reads it' }] }));
+  const ok = check(dir);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /allow build\.log: the build tool reads it/);
+});
+
+test('run records inside files: JSON run keys and test counts in docs', () => {
+  const r = check(repo({ 'smoke.json': '{\n  "checkedAt": "2026-10-10",\n  "runnerTestsPassed": 28\n}\n', 'README.md': 'All 184 tests passed.\nIt matched all 28 fixtures.\n' }));
+  assert.equal(r.status, 1);
+  for (const at of ['smoke.json:2', 'smoke.json:3', 'README.md:1', 'README.md:2']) assert.match(r.stderr, new RegExp(`^${at.replace('.', '\\.')}: .*run record`, 'm'));
+});
+
+test('history and process wording fails; allowPhrases waives product vocabulary', () => {
+  const dir = repo({ 'README.md': 'Fixed in round 3 after the independent review.\nThe first slice is done.\n' });
+  const r = check(dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /README\.md:1: "Fixed in round 3"/);
+  assert.match(r.stderr, /README\.md:1: "independent review"/);
+  assert.match(r.stderr, /README\.md:2: "first slice"/);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ allowPhrases: [{ pattern: 'round 3|independent review|first slice', paths: ['README.md'], reason: 'quoted on purpose' }] }));
+  assert.equal(check(dir).status, 0);
+});
+
+test('a real sign-off phrase is product vocabulary; a review sign-off is not', () => {
+  assert.equal(check(repo({ 'a.py': '# a real sign-off such as "Thank you." is kept\n' })).status, 0);
+  assert.equal(check(repo({ 'a.md': 'Review changes before sign-off.\n' })).status, 1);
+});
+
+test('a sentence repeated across docs fails, except in dupSkip paths', () => {
+  const s = 'The renderer captures every frame through the browser and pipes it straight into the encoder.';
+  const dir = repo({ 'README.md': `${s}\n`, 'docs/ARCH.md': `Intro.\n\n${s}\n`, 'skill/SKILL.md': `${s}\n` });
+  const r = check(dir);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /the same sentence is also at/);
+  writeFileSync(join(dir, 'docs/ARCH.md'), 'Intro.\n');
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ dupSkip: [{ path: 'skill/**', reason: 'installed on its own' }] }));
+  assert.equal(check(dir).status, 0);
+});
+
+test('a link to a missing file fails; links to files, folders, anchors and URLs pass', () => {
+  const ok = repo({ 'README.md': '[a](docs/a.md) [d](docs) [x](#top) [u](https://example.com) [s](docs/a.md#part)\n', 'docs/a.md': 'A.\n' });
+  assert.equal(check(ok).status, 0);
+  const r = check(repo({ 'README.md': 'See [the plan](docs/missing.md).\n' }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /link to docs\/missing\.md/);
+});
+
+test('budgets: growth fails; a staged commit that shrinks the docs lowers the budget and stages the config', () => {
+  const dir = repo({ 'README.md': 'one\ntwo\nthree\n' }, { budgets: { docs: 2 } });
+  assert.match(check(dir).stderr, /docs: 3 lines, over the budget of 2/);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ budgets: { docs: 5 } }));
+  git(dir, 'add', '-A');
+  const r = check(dir, ['--staged']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /lowered docs to 3/);
+  assert.equal(JSON.parse(git(dir, 'show', ':.unbloat.json').stdout).budgets.docs, 3);
+});
+
+test('instruction budgets count .cursorrules as well as Markdown instruction files', () => {
+  const r = check(repo({ 'AGENTS.md': 'a\n', '.cursorrules': 'b\nc\n' }, { budgets: { instructions: 2 } }));
+  assert.match(r.stderr, /instructions: 3 lines, over the budget of 2/);
+});
+
+test('--staged checks the index, not the working tree', () => {
+  const dir = repo({ 'README.md': 'Fine.\n' });
+  writeFileSync(join(dir, 'README.md'), 'After the review this changed.\n'); // not staged
+  assert.equal(check(dir, ['--staged']).status, 0);
+  git(dir, 'add', '-A');
+  assert.equal(check(dir, ['--staged']).status, 1);
+});
+
+test('--init writes .unbloat.json with current budgets and a pre-commit hook that blocks a process file', () => {
+  const dir = temp('unbloat-check-');
+  git(dir, 'init', '-q');
+  git(dir, 'config', 'user.email', 'test@example.com');
+  git(dir, 'config', 'user.name', 'test');
+  writeFileSync(join(dir, 'README.md'), '# Tool\n\nIt renders.\n');
+  const r = check(dir, ['--init']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(readFileSync(join(dir, '.unbloat.json'), 'utf8')).budgets.docs, 3);
+  assert.ok(existsSync(join(dir, '.git/hooks/pre-commit')));
+  writeFileSync(join(dir, 'HANDOFF.md'), 'next steps\n');
+  git(dir, 'add', '-A');
+  const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
+  assert.notEqual(commit.status, 0);
+  assert.match(commit.stderr, /HANDOFF\.md: process file/);
+});
+
+test('the guard denies creating a process file or committing with --no-verify in an opted-in repo only', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  const deny = input => JSON.parse(check(dir, ['--guard'], JSON.stringify({ cwd: dir, ...input })).stdout || '{}').hookSpecificOutput;
+  assert.equal(deny({ tool_name: 'Write', tool_input: { file_path: join(dir, 'HANDOFF.md') } })?.permissionDecision, 'deny');
+  assert.equal(deny({ tool_name: 'Write', tool_input: { file_path: join(dir, 'src/new.js') } }), undefined);
+  assert.equal(deny({ tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Add File: reviews/r1.md\n+x\n*** End Patch' } })?.permissionDecision, 'deny');
+  assert.equal(deny({ tool_name: 'Bash', tool_input: { command: 'git commit --no-verify -m x' } })?.permissionDecision, 'deny');
+  assert.equal(deny({ tool_name: 'Bash', tool_input: { command: 'echo done > PLAN.md' } })?.permissionDecision, 'deny');
+  assert.equal(deny({ tool_name: 'Bash', tool_input: { command: 'git commit -m "x" 2>&1' } }), undefined);
+  // ~ and $HOME are the home folder, not a folder named "~" inside the repository
+  assert.equal(deny({ tool_name: 'Bash', tool_input: { command: 'run >> ~/unbloat-check-guard-test/run.log' } }), undefined);
+  assert.equal(deny({ tool_name: 'Bash', tool_input: { command: 'run >> "$HOME/unbloat-check-guard-test/run.log"' } }), undefined);
+  const other = temp('unbloat-check-');
+  git(other, 'init', '-q');
+  const r = check(other, ['--guard'], JSON.stringify({ cwd: other, tool_name: 'Write', tool_input: { file_path: join(other, 'PLAN.md') } }));
+  assert.equal(r.stdout, '');
+});
+
+test('--changes reports exceptions added and budgets raised since the saved snapshot', () => {
+  const dir = repo({ 'README.md': 'x\n' }, { keep: [{ path: 'a/', reason: 'fixture' }], budgets: { docs: 5 } });
+  git(dir, 'commit', '-q', '-m', 'opt in');
+  const snap = join(temp('unbloat-snap-'), 'snapshot.json');
+  assert.match(check(dir, [`--changes=${snap}`]).stdout, /new: keep a\/: fixture/); // no snapshot: all of it is new
+  assert.match(check(dir, [`--changes=${snap}`, '--save']).stdout, /saved .* 1 repositories/);
+  assert.match(check(dir, [`--changes=${snap}`]).stdout, /0 new exception\(s\), 0 raised or removed budget\(s\) since 20/);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ keep: [{ path: 'a/', reason: 'fixture' }, { path: 'b/', reason: 'cache' }], budgets: { docs: 9 } }));
+  git(dir, 'commit', '-q', '-am', 'Keep b/ and grow the docs');
+  const out = check(dir, [`--changes=${snap}`]).stdout;
+  assert.match(out, /new: keep b\/: cache/);
+  assert.doesNotMatch(out, /new: keep a\//);
+  assert.match(out, /raised: docs 5 -> 9 \([0-9a-f]+ Keep b\/ and grow the docs\)/);
+});
+
+test('--disk lists ignored build-up, and kept folders apart with their reasons', () => {
+  const dir = repo({ '.gitignore': '.scratch/\n', 'README.md': 'x\n' }, { keep: [{ path: '.scratch/fixture/', reason: 'test input' }] });
+  mkdirSync(join(dir, '.scratch/old'), { recursive: true });
+  mkdirSync(join(dir, '.scratch/fixture'), { recursive: true });
+  writeFileSync(join(dir, '.scratch/old/a.txt'), 'x');
+  writeFileSync(join(dir, '.scratch/fixture/b.txt'), 'y');
+  const out = check(dir, ['--disk']).stdout;
+  assert.match(out, /scratch\/output +\.scratch\/old\//);
+  assert.match(out, /kept \(\.unbloat\.json "keep"\):\n.*\.scratch\/fixture\/: test input/);
+});
+
+test('a repository with the older .lean.json is checked the same way, one config per repository under --all', () => {
+  const legacy = repo({ 'PLAN.md': 'x\n' }, { budgets: {} }, '.lean.json');
+  const r = check(legacy);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^PLAN\.md: process file/m);
+  const parent = temp('unbloat-all-');
+  const a = repo({ 'README.md': 'x\n' }, { keep: [{ path: 'a/', reason: 'new name' }] });
+  const b = repo({ 'README.md': 'x\n' }, { keep: [{ path: 'b/', reason: 'old name' }] }, '.lean.json');
+  renameSync(a, join(parent, 'a'));
+  renameSync(b, join(parent, 'b'));
+  const all = check(parent, ['--all', parent]);
+  assert.equal(all.status, 0, all.stderr);
+  assert.match(all.stdout, /exception\(s\) in \.unbloat\.json\n {2}keep a\/: new name/);
+  assert.match(all.stdout, /exception\(s\) in \.lean\.json\n {2}keep b\/: old name/);
+});
+
+test('--install-hook replaces a lean-check hook, keeps a project hook that runs the check, and moves any other aside', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  const hook = join(dir, '.git/hooks/pre-commit');
+  writeFileSync(hook, '#!/bin/sh\n# lean-check pre-commit hook: old\n');
+  assert.equal(check(dir, ['--install-hook']).status, 0);
+  assert.match(readFileSync(hook, 'utf8'), /# unbloat-check pre-commit hook/);
+  assert.ok(!existsSync(join(dir, '.git/hooks/pre-commit.local')));
+  writeFileSync(hook, '#!/bin/sh\nnode tools/unbloat-check.mjs --staged\n');
+  check(dir, ['--install-hook']);
+  assert.match(readFileSync(hook, 'utf8'), /tools\/unbloat-check\.mjs/);
+  writeFileSync(hook, '#!/bin/sh\nnpm run lint\n');
+  check(dir, ['--install-hook']);
+  assert.match(readFileSync(join(dir, '.git/hooks/pre-commit.local'), 'utf8'), /npm run lint/);
+});
+
+test('found in real repositories: no false repeat within one line, case-sensitive instruction names, product wording', () => {
+  const row = '| Claude Code with the full plugin marketplace and all of its installed skills | claude code with the full plugin marketplace and all of its installed skills |';
+  const r = check(repo({ 'docs/agents.md': `${row}\n`, 'AGENTS.md': 'a\n', 'src/a.js': '// the user selected these skills\n' }, { budgets: { instructions: 1 } }));
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /unbloat-check: ok \(\d+ files; docs 2, instructions 1 lines\)/);
+});
+
+test('--disk leaves out the config; a hooks folder tracked in the repository is never rewritten', () => {
+  const dir = repo({ 'README.md': 'x\n', '.husky/pre-commit': 'npm test\n' });
+  assert.doesNotMatch(check(dir, ['--disk']).stdout, /\.unbloat\.json/);
+  git(dir, 'config', 'core.hooksPath', '.husky');
+  const r = check(dir, ['--install-hook']);
+  assert.match(r.stderr, /hooks live in \.husky\/ \(core\.hooksPath\).*add this line/);
+  assert.equal(readFileSync(join(dir, '.husky/pre-commit'), 'utf8'), 'npm test\n');
+  assert.ok(!existsSync(join(dir, '.husky/pre-commit.local')));
+});
+
+test('the installed hook still runs a moved-aside hook that is not executable', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo chained-hook-ran >&2\nexit 1\n');
+  check(dir, ['--install-hook']);
+  git(dir, 'add', '-A');
+  const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
+  assert.notEqual(commit.status, 0);
+  assert.match(commit.stderr, /chained-hook-ran/);
+});
+
+test('the end-of-turn gate sends back only problems the turn brought, at most twice a turn', () => {
+  const dir = repo({ 'README.md': 'Fixed in round 3.\n' }, { allowPhrases: [] });
+  git(dir, 'commit', '-q', '-m', 'an old problem in a file the turn leaves alone');
+  const hook = (flag) => check(dir, [flag], JSON.stringify({ cwd: dir })).stdout;
+  hook('--turn-start');
+  assert.equal(hook('--stop'), ''); // nothing changed this turn
+  writeFileSync(join(dir, 'PLAN.md'), 'next steps\n');
+  writeFileSync(join(dir, 'docs.md'), 'It renders pages after the review.\n');
+  const sent = JSON.parse(hook('--stop'));
+  assert.equal(sent.decision, 'block');
+  assert.match(sent.reason, /PLAN\.md: process file/);
+  assert.match(sent.reason, /docs\.md:1: "after the review"/);
+  assert.doesNotMatch(sent.reason, /README\.md/);
+  assert.equal(JSON.parse(hook('--stop')).decision, 'block');
+  assert.equal(hook('--stop'), ''); // two sends a turn
+  hook('--turn-start');
+  assert.equal(hook('--stop'), ''); // what was already changed when the turn began isn't this turn's
+  writeFileSync(join(dir, 'PLAN.md'), 'more steps\n');
+  assert.equal(JSON.parse(hook('--stop')).decision, 'block'); // until the turn changes it, with a fresh count
+  assert.equal(check(temp('unbloat-check-'), ['--stop'], '{}').stdout, ''); // not a repository
+});
+
+test('each agent session keeps its own turn record', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  git(dir, 'commit', '-q', '-m', 'start');
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session })).stdout;
+  hook('--turn-start', 'a');
+  writeFileSync(join(dir, 'PLAN.md'), 'x\n');
+  hook('--turn-start', 'b'); // b starts after a wrote PLAN.md
+  assert.equal(hook('--stop', 'b'), '');
+  assert.equal(JSON.parse(hook('--stop', 'a')).decision, 'block');
+});
+
+test('--staged takes the config from the index', () => {
+  const dir = repo({ 'PLAN.md': 'x\n' });
+  rmSync(join(dir, '.unbloat.json')); // deleted from the working tree, still staged
+  assert.equal(check(dir, ['--staged']).status, 1);
+  git(dir, 'rm', '-q', '--cached', '.unbloat.json');
+  assert.equal(check(dir, ['--staged']).status, 0); // opted out in the commit itself
+});
+
+test('source code with a process-sounding name is product; a handoff folder is not', () => {
+  const r = check(repo({ 'src/receipt.ts': 'export {};\n', 'db/evidence/schema.sql': 'select 1;\n', 'handoff/next.md': 'x\n' }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^handoff\/next\.md: process file/m);
+  assert.doesNotMatch(r.stderr, /receipt\.ts|schema\.sql/);
+});
+
+test('licence files are skipped by their names only, and a bad config is reported, not obeyed', () => {
+  const r = check(repo({ 'docs/roofline.md': 'After the review it changed.\n', 'LICENSE': 'After the review.\n' }));
+  assert.match(r.stderr, /docs\/roofline\.md:1/);
+  assert.doesNotMatch(r.stderr, /^LICENSE/m);
+  const bad = check(repo({ 'README.md': 'x\n' }, { allow: null, budgets: { docs: 'oops' }, allowPhrases: [{ pattern: '(', reason: 'x' }] }));
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /"allow" must be a list/);
+  assert.match(bad.stderr, /budgets\.docs must be a whole number/);
+  assert.match(bad.stderr, /allowPhrases pattern \(/);
+});
+
+test('a link with parentheses in its path resolves', () => {
+  const r = check(repo({ 'README.md': '[API](docs/api(v1).md)\n', 'docs/api(v1).md': 'API.\n' }));
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('hook install: no collision with pre-commit.local, a missing hooks folder, a path that is not shell syntax', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo one\n');
+  writeFileSync(join(dir, '.git/hooks/pre-commit.local'), 'echo two\n');
+  const r = check(dir, ['--install-hook']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /both exist, so neither is moved/);
+  assert.equal(readFileSync(join(dir, '.git/hooks/pre-commit.local'), 'utf8'), 'echo two\n');
+  rmSync(join(dir, '.git/hooks'), { recursive: true });
+  assert.equal(check(dir, ['--install-hook']).status, 0);
+  assert.match(readFileSync(join(dir, '.git/hooks/pre-commit'), 'utf8'), /^installed='[^']*unbloat-check\.mjs'$/m);
+});
+
+test('the guard reads quoted, tee, PowerShell and git -C forms, and ignores commit text that is only text', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  const outside = temp('unbloat-outside-');
+  const denied = (command, tool = 'Bash', cwd = dir) =>
+    JSON.parse(check(cwd, ['--guard'], JSON.stringify({ cwd, tool_name: tool, tool_input: { command } })).stdout || '{}').hookSpecificOutput?.permissionDecision === 'deny';
+  mkdirSync(join(dir, 'my dir'));
+  assert.ok(denied('printf x > "my dir/PLAN.md"'));
+  assert.ok(denied('tee -a -- notes.txt PLAN.md < x'));
+  assert.ok(denied('Set-Content -Path PLAN.md -Value x', 'PowerShell'));
+  assert.ok(denied(`git -C '${dir}' commit --no-verify -m x`, 'Bash', outside));
+  assert.ok(denied(`git -C ${dir.split('\\').join('/')} commit --no-verify -m x`, 'Bash', outside));
+  assert.ok(denied(`git -C ${dir} commit --no-verify -m x`, 'PowerShell', outside));
+  assert.ok(denied(`Out-File ${join(dir, 'PLAN.md')}`, 'PowerShell'));
+  assert.ok(denied('git commit -anm x'));
+  assert.ok(!denied('echo "git commit --no-verify"'));
+  assert.ok(!denied('git commit -m "Fix -n flag docs"'));
+  assert.ok(!denied("cat > notes.txt <<'EOF'\nrun git commit --no-verify > PLAN.md\nEOF"));
+});
+
+test('--disk lists the rest of a folder that holds a kept path, not the folder', () => {
+  const dir = repo({ '.gitignore': '.cache/\n', 'README.md': 'x\n' }, { keep: [{ path: '.cache/live/', reason: 'in use' }] });
+  mkdirSync(join(dir, '.cache/live'), { recursive: true });
+  mkdirSync(join(dir, '.cache/old'), { recursive: true });
+  writeFileSync(join(dir, '.cache/old/a.bin'), Buffer.alloc(2 << 20));
+  writeFileSync(join(dir, '.cache/live/b.bin'), Buffer.alloc(2 << 20));
+  const out = check(dir, ['--disk']).stdout;
+  assert.match(out, /\.cache\/old\//);
+  assert.doesNotMatch(out, / \.cache\/\n/);
+});
+
+test('--changes reports a removed budget', () => {
+  const dir = repo({ 'README.md': 'x\n' }, { budgets: { docs: 5 } });
+  git(dir, 'commit', '-q', '-m', 'opt in');
+  const snap = join(temp('unbloat-snap-'), 'snapshot.json');
+  check(dir, [`--changes=${snap}`, '--save']);
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({ budgets: {} }));
+  assert.match(check(dir, [`--changes=${snap}`]).stdout, /removed: the docs budget \(was 5\)/);
+});
+
+test('templates and components with process-sounding names are product', () => {
+  const r = check(repo({ 'templates/receipt.html': '<p></p>\n', 'src/reviews/Card.vue': '<template/>\n' }));
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('a hook moved aside runs first, so what it stages is checked too', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo x > PLAN.md\ngit add PLAN.md\n');
+  check(dir, ['--install-hook']);
+  git(dir, 'add', '-A');
+  const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
+  assert.notEqual(commit.status, 0);
+  assert.match(commit.stderr, /PLAN\.md: process file/);
+});
+
+test('the guard: newline-separated, quoted, cd and comment-only cases', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  const outside = temp('unbloat-outside-');
+  const denied = (command, cwd = dir) =>
+    JSON.parse(check(cwd, ['--guard'], JSON.stringify({ cwd, tool_name: 'Bash', tool_input: { command } })).stdout || '{}').hookSpecificOutput?.permissionDecision === 'deny';
+  assert.ok(denied('git status\ngit commit --no-verify -m x'));
+  assert.ok(denied('git commit "--no-verify" -m x'));
+  assert.ok(denied(`cd '${dir}' && git commit --no-verify -m x`, outside));
+  assert.ok(denied(`cd '${dir}' && echo x > PLAN.md`, outside));
+  assert.ok(!denied('git commit -m "-n is a flag" --author "A <a@b.c>"'));
+});
+
+test('hooks: a project hook that only mentions the check in a comment is not current; ..hooks is inside the repository', () => {
+  const dir = repo({ 'README.md': 'x\n', '..hooks/pre-commit': 'npm test\n' });
+  git(dir, 'config', 'core.hooksPath', '..hooks');
+  const r = check(dir, ['--install-hook']);
+  assert.equal(r.status, 1);
+  assert.equal(readFileSync(join(dir, '..hooks/pre-commit'), 'utf8'), 'npm test\n');
+  writeFileSync(join(dir, '..hooks/pre-commit'), '# node tools/unbloat-check.mjs --staged\nexit 0\n');
+  assert.equal(check(dir, ['--install-hook']).status, 1);
+});
+
+test('config and links: allowPhrases paths must be a list; an encoded # in a link resolves', () => {
+  const bad = check(repo({ 'README.md': 'x\n' }, { allowPhrases: [{ pattern: 'x', paths: 'README.md', reason: 'product' }] }));
+  assert.match(bad.stderr, /"paths" must be a list of globs/);
+  assert.equal(check(repo({ 'README.md': '[x](a%23b.md)\n', 'a#b.md': 'x\n' })).status, 0);
+});
+
+test('--disk: a scratch folder holding a model folder is opened up, and a dangling link does not crash it', () => {
+  const dir = repo({ '.gitignore': '.scratch/\nlink\n', 'README.md': 'x\n' });
+  mkdirSync(join(dir, '.scratch/job/models'), { recursive: true });
+  writeFileSync(join(dir, '.scratch/job/models/model.bin'), 'w');
+  writeFileSync(join(dir, '.scratch/job/out.txt'), 'o');
+  spawnSync('ln', ['-s', join(dir, 'missing'), join(dir, 'link')]);
+  const r = check(dir, ['--disk']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /\.scratch\/job\/\s*$/m);
+  assert.doesNotMatch(r.stdout, /models/);
+});
+
+test('a sentence repeated across wrapped lines is found, at the line it starts on', () => {
+  const s1 = 'The renderer captures every frame through the\nbrowser and pipes it straight into the encoder.';
+  const s2 = 'Intro.\n\nThe renderer captures every frame through the browser\nand pipes it straight into the encoder.';
+  const r = check(repo({ 'README.md': `${s1}\n`, 'docs/a.md': `${s2}\n`, 'docs/list.md': '- one item that is short\n- another item\n' }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /README\.md:1: the same sentence is also at docs\/a\.md:3/);
+});
+
+test('an untracked symlink to a folder, as the skills CLI installs, is read as a link, not a file', () => {
+  const dir = repo({ '.agents/skills/x/SKILL.md': 'x\n' });
+  mkdirSync(join(dir, '.claude/skills'), { recursive: true });
+  spawnSync('ln', ['-s', '../../.agents/skills/x', join(dir, '.claude/skills/x')]);
+  const r = check(dir);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('a copy of this skill installed in an agent folder is vendored; its source folder is still checked', () => {
+  const quoted = 'A PLAN.md is a process file.\n';
+  const r = check(repo({ '.claude/skills/unbloat/references/check.md': quoted, '.agents/skills/unbloat/SKILL.md': quoted,
+    'skills/unbloat/references/check.md': quoted }));
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /^skills\/unbloat\/references\/check\.md:1: "PLAN\.md"/m);
+  assert.doesNotMatch(r.stderr, /^\.(?:claude|agents)\//m);
+});
+
+test('found by the final review: product names and prose, a repo regex, a linked config, an empty repo, keep without a slash', () => {
+  const product = check(repo({ 'packages/ledger/package.json': '{}\n', 'assets/receipt.png': 'x', 'services/handoff/config.yaml': 'a: 1\n',
+    'README.md': 'Acceptance criteria are listed. If the user requested a refund, it is notified after the review period. Read the next slice. An 80/20 test split.\n' }));
+  assert.equal(product.status, 0, product.stderr);
+  assert.equal(check(repo({ 'docs/handoff.md': 'x\n' })).status, 1); // a handoff note is still process
+  const slow = repo({ 'README.md': `after the review ${'x'.repeat(40)}!\n` }, { allowPhrases: [{ pattern: '(x+x+)+y', reason: 'r' }] });
+  const started = Date.now();
+  assert.match(check(slow).stderr, /can hang the check/);
+  assert.ok(Date.now() - started < 5000);
+  if (process.platform !== 'win32') { // making a symlink on Windows needs extra rights
+    const linked = repo({ 'README.md': 'x\n' });
+    rmSync(join(linked, '.unbloat.json'));
+    spawnSync('ln', ['-s', '/etc/hosts', join(linked, '.unbloat.json')]);
+    const r = check(linked);
+    assert.match(r.stderr, /must be a regular file/);
+    assert.doesNotMatch(r.stderr, /Host|localhost/);
+  }
+  const empty = repo({ 'README.md': 'x\n' });
+  git(empty, 'rm', '-q', '--cached', '-r', '.');
+  check(empty, ['--turn-start'], JSON.stringify({ cwd: empty }));
+  git(empty, 'add', '-A');
+  writeFileSync(join(empty, 'PLAN.md'), 'x\n');
+  git(empty, 'add', 'PLAN.md');
+  git(empty, 'commit', '-q', '--no-verify', '-m', 'first');
+  assert.equal(JSON.parse(check(empty, ['--stop'], JSON.stringify({ cwd: empty })).stdout).decision, 'block');
+  const kept = repo({ '.gitignore': '.scratch/\n', 'README.md': 'x\n' }, { keep: [{ path: '.scratch/fixture', reason: 'input' }] });
+  mkdirSync(join(kept, '.scratch/fixture'), { recursive: true });
+  writeFileSync(join(kept, '.scratch/fixture/a.txt'), 'x');
+  assert.doesNotMatch(check(kept, ['--disk']).stdout, /scratch\/output +\.scratch\/fixture/);
+  assert.match(check(repo({ 'README.md': 'x\n' }), ['--all', '/no/such/folder']).stderr, /is not a folder/);
+  writeFileSync(join(kept, '.unbloat.json'), '{');
+  const broken = check(kept);
+  assert.equal(broken.status, 1);
+  assert.match(broken.stderr, /^unbloat-check: \.unbloat\.json: /m);
+  assert.doesNotMatch(broken.stderr, /at \w+ \(/); // one line, no stack trace
+});
+
+test('the guard sees commits and writes inside compound commands, shells and quoting tricks', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  const denied = command =>
+    JSON.parse(check(dir, ['--guard'], JSON.stringify({ cwd: dir, tool_name: 'Bash', tool_input: { command } })).stdout || '{}').hookSpecificOutput?.permissionDecision === 'deny';
+  for (const command of ['if true; then git commit --no-verify -m x; fi', 'bash -c "git commit --no-verify -m x"',
+    '(git commit --no-verify -m x)', 'git -c core.hooksPath=/dev/null commit -m x', 'echo x >| PLAN.md',
+    "printf x > PL''AN.md", "printf x > $'PLAN.md'", 'touch PLAN.md', 'cp README.md PLAN.md'])
+    assert.ok(denied(command), command);
+  assert.ok(!denied('git -c user.name=x commit -m "fine"'));
+});
+
+test('hooks: a shared hooks folder outside the repository is never written; a session start leaves a project hook alone', () => {
+  const shared = temp('unbloat-shared-');
+  writeFileSync(join(shared, 'pre-commit'), 'echo shared\n');
+  const dir = repo({ 'README.md': 'x\n' });
+  git(dir, 'config', 'core.hooksPath', shared);
+  const r = check(dir, ['--install-hook']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /outside this repository/);
+  assert.equal(readFileSync(join(shared, 'pre-commit'), 'utf8'), 'echo shared\n');
+  assert.ok(!existsSync(join(shared, 'pre-commit.local')));
+  const own = repo({ 'README.md': 'x\n' });
+  writeFileSync(join(own, '.git/hooks/pre-commit'), 'exec pre-commit run\n');
+  check(own, ['--session-start'], JSON.stringify({ cwd: own }));
+  assert.equal(readFileSync(join(own, '.git/hooks/pre-commit'), 'utf8'), 'exec pre-commit run\n');
+  assert.ok(!existsSync(join(own, '.git/hooks/pre-commit.local')));
+});
+
+test('security review: --init never writes through a config link, and control characters are printed escaped', () => {
+  const dir = temp('unbloat-check-');
+  git(dir, 'init', '-q');
+  if (process.platform !== 'win32') {
+    spawnSync('ln', ['-s', join(dir, 'elsewhere.json'), join(dir, '.unbloat.json')]);
+    assert.equal(check(dir, ['--init']).status, 1);
+    assert.ok(!existsSync(join(dir, 'elsewhere.json')));
+  }
+  if (process.platform === 'win32') return; // Windows file names can't hold control characters
+  const r = check(repo({ 'notes/review-\x1b]52;c;aGk=\x07.md': 'x\n' }));
+  assert.doesNotMatch(r.stderr, /\x1b/);
+  assert.match(r.stderr, /\\x1b\]52/);
+});
