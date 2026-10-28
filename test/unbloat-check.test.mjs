@@ -1,7 +1,7 @@
 // node --test: unbloat-check against throwaway git repositories.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -625,6 +625,66 @@ test('a user regex that can backtrack exponentially is refused rather than run',
   const r = check(dir);
   assert.match(r.stderr, /can hang the check/);
   assert.ok(Date.now() - started < 5000);
+});
+
+test('adjacent-quantifier waivers fail within the matching deadline in both CLI modes', () => {
+  const dir = repo({ 'README.md': `${'after the review ' + 'x'.repeat(64) + '!\n'}`.repeat(3) },
+    { allowPhrases: [{ pattern: 'x+x+x+x+x+y', paths: ['README.md'], reason: 'fixture vocabulary' }] });
+  for (const args of [[], ['--staged']]) {
+    const r = spawnSync(process.execPath, [SCRIPT, ...args], { cwd: dir, encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL' });
+    assert.ifError(r.error);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /allowPhrases matching exceeded 100 ms/);
+  }
+});
+
+test('bounded waiver matching preserves native regex syntax and path scoping', () => {
+  const dir = repo({ 'README.md': 'after the review\n' }, { allowPhrases: [
+    { pattern: '(?<=after )the (review)\\b', paths: ['README.md'], reason: 'product vocabulary' }
+  ] });
+  assert.equal(check(dir).status, 0);
+  assert.equal(check(dir, ['--staged']).status, 0);
+  writeFileSync(join(dir, 'other.md'), 'after the review\n');
+  assert.match(check(dir).stderr, /other\.md:1/);
+});
+
+test('both config names reject symlink mode in the index even without filesystem symlinks', () => {
+  for (const name of ['.unbloat.json', '.lean.json']) {
+    const dir = repo({ 'README.md': 'x\n' }, { budgets: { docs: 999 } }, name);
+    const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], { cwd: dir, input: '{"budgets":{"docs":999}}', encoding: 'utf8' });
+    assert.equal(blob.status, 0, blob.stderr);
+    assert.equal(git(dir, 'update-index', '--cacheinfo', `120000,${blob.stdout.trim()},${name}`).status, 0);
+    const r = check(dir, ['--staged']);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /must be a regular staged file/);
+    assert.equal(JSON.parse(readFileSync(join(dir, name), 'utf8')).budgets.docs, 999);
+  }
+});
+
+test('a staged JSON-shaped config symlink never rewrites its dummy referent', t => {
+  if (process.platform === 'win32') { t.skip('JSON-shaped filenames are not valid on Windows'); return; }
+  for (const name of ['.unbloat.json', '.lean.json']) {
+    const dir = repo({ 'README.md': 'x\n' }, { budgets: { docs: 999 } }, name);
+    const leaf = '{"budgets":{"docs":999}}', target = join(dir, leaf);
+    writeFileSync(target, 'dummy content\n');
+    rmSync(join(dir, name));
+    if (!link(t, leaf, join(dir, name))) return;
+    assert.equal(git(dir, 'add', '--', name).status, 0);
+    const r = check(dir, ['--staged']);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /must be a regular staged file/);
+    assert.equal(readFileSync(target, 'utf8'), 'dummy content\n');
+  }
+});
+
+test('ratcheting replaces the config without modifying another hard link to it', () => {
+  const dir = repo({ 'README.md': 'x\n' }, { budgets: { docs: 999 } });
+  const copy = join(temp('unbloat-copy-'), 'config.json');
+  linkSync(join(dir, '.unbloat.json'), copy);
+  const r = check(dir, ['--staged']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(JSON.parse(readFileSync(copy, 'utf8')).budgets.docs, 999);
+  assert.equal(JSON.parse(git(dir, 'show', ':.unbloat.json').stdout).budgets.docs, 1);
 });
 
 test('a hook that only names the check in an echo, or after an exit, is not current', () => {

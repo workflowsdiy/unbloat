@@ -4,10 +4,11 @@
 // Usage is in ../references/check.md.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createContext, Script } from 'node:vm';
 
 const SELF = fileURLToPath(import.meta.url);
 // The config file names, newest first (.lean.json is the name lean-check used). CONFIG is the one the repository
@@ -23,10 +24,13 @@ function readConfig(root) {
 const configOf = root => { const n = NAMES.find(n => existsSync(join(root, n))); if (n) CONFIG = n; return n ?? null; };
 // For --staged the index decides: a config deleted from the working tree but still staged still gates the commit.
 const stagedConfigOf = root => {
-  const staged = git(root, ['ls-files', '-z', '--cached', '--', ...NAMES]).toString().split('\0');
-  const n = NAMES.find(n => staged.includes(n));
-  if (n) CONFIG = n;
-  return n ?? null;
+  const staged = git(root, ['ls-files', '-z', '--stage', '--', ...NAMES]).toString().split('\0');
+  const entry = NAMES.map(n => staged.find(e => e.endsWith(`\t${n}`))).find(Boolean);
+  if (!entry) return null;
+  const [mode, n] = entry.split('\t');
+  CONFIG = n;
+  if (!/^100(?:644|755) [a-f0-9]+ 0$/.test(mode)) throw new Error(`${CONFIG} must be a regular staged file`);
+  return n;
 };
 // Path containment that holds across drives: relative() returns an absolute path when there's no common root.
 // A path with symlinks resolved (macOS's /var is /private/var); a path that doesn't exist yet keeps its last parts.
@@ -242,7 +246,19 @@ function check(files, config) {
   const recordFile = matcher(RECORD_FILES), instruction = matcher(INSTRUCTIONS, '');
   const waivers = config.allowPhrases.filter(w => w && typeof w.pattern === 'string')
     .map(w => ({ re: new RegExp(w.pattern, 'i'), paths: matcher(w.paths ?? ['**']) }));
-  const waived = (path, line) => waivers.some(w => w.paths(path) && w.re.test(line));
+  // Only this fixed expression runs in the VM; patterns remain data. The deadline bounds native regex work.
+  const waiverContext = createContext({ patterns: [], line: '' });
+  const waiverTest = new Script('patterns.some(re => re.test(line))');
+  const waived = (path, line) => {
+    waiverContext.patterns = waivers.filter(w => w.paths(path)).map(w => w.re);
+    if (waiverContext.patterns.length === 0) return false;
+    waiverContext.line = line;
+    try { return waiverTest.runInContext(waiverContext, { timeout: 100 }); }
+    catch (e) {
+      if (e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`${CONFIG}: allowPhrases matching exceeded 100 ms; simplify the patterns`);
+      throw e;
+    }
+  };
   const dirs = new Set();
   for (const p of files.keys()) for (let d = posix.dirname(p); d !== '.'; d = posix.dirname(d)) dirs.add(d);
   const sentences = new Map();
@@ -383,7 +399,15 @@ function ratchet(root, configText, lowered) {
   if (spawnSync('git', ['diff', '--quiet', '--', CONFIG], { cwd: root }).status !== 0) return;
   const config = JSON.parse(configText);
   for (const [group, lines] of lowered) config.budgets[group] = lines;
-  writeFileSync(join(root, CONFIG), JSON.stringify(config, null, 2) + '\n');
+  const path = join(root, CONFIG), st = lstatSync(path, { throwIfNoEntry: false });
+  if (!st?.isFile()) throw new Error(`${CONFIG} must be a regular file, not a link or folder`);
+  // Replacing the directory entry cannot write through a link swapped in after the type check.
+  const temp = mkdtempSync(join(root, '.unbloat-'));
+  try {
+    const pending = join(temp, CONFIG);
+    writeFileSync(pending, JSON.stringify(config, null, 2) + '\n', { flag: 'wx', mode: st.mode & 0o777 });
+    renameSync(pending, path);
+  } finally { rmSync(temp, { recursive: true, force: true }); }
   git(root, ['add', CONFIG]);
   console.log(`unbloat-check: lowered ${lowered.map(([g, n]) => `${g} to ${n}`).join(', ')} lines (${CONFIG} staged)`);
 }
