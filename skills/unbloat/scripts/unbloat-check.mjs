@@ -3,6 +3,7 @@
 // growth nobody decided on. A repository opts in with a .unbloat.json at its root; `unbloat-check --init` writes one.
 // Usage is in ../references/check.md.
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
@@ -115,6 +116,21 @@ function repoRoot(dir) {
   }
 }
 
+// A repeated group whose body holds alternation, a repeat or another group can take exponential time on a long line:
+// (x|xx)+, (x+)+, ((x))*. Such a pattern is refused rather than run.
+function riskyRepeat(pattern) {
+  const open = [];
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] === '\\') i++;
+    else if (pattern[i] === '(') open.push(i);
+    else if (pattern[i] === ')' && open.length > 0) {
+      const body = pattern.slice(open.pop() + 1, i).replace(/^\?:/, '').replace(/\\./g, '');
+      if (/[|+*?{}()]/.test(body) && /[+*{]/.test(pattern[i + 1] ?? '')) return true;
+    }
+  }
+  return false;
+}
+
 function loadConfig(text, where) {
   let c;
   try { c = JSON.parse(text); } catch (e) { throw new Error(`${where}: ${e.message}`); }
@@ -133,9 +149,7 @@ function loadConfig(text, where) {
     if (w.paths !== undefined && !(Array.isArray(w.paths) && w.paths.every(p => typeof p === 'string'))) {
       config.invalid.push(`allowPhrases pattern ${w.pattern}: "paths" must be a list of globs`); w.paths = [];
     }
-    // A quantified group that is itself quantified, like (x+)+, can take exponential time on a long line.
-    const nested = /\((?:[^()\\]|\\.)*[+*}](?:[^()\\]|\\.)*\)[+*{]/.test(w.pattern);
-    try { if (nested) throw new Error('a repeated group with a repeat inside can hang the check'); new RegExp(w.pattern, 'i'); }
+    try { if (riskyRepeat(w.pattern)) throw new Error('a repeated group with alternation, a repeat or a group inside can hang the check'); new RegExp(w.pattern, 'i'); }
     catch (e) { config.invalid.push(`allowPhrases pattern ${w.pattern}: ${e.message}`); w.pattern = '(?!)'; }
   }
   return config;
@@ -168,16 +182,21 @@ const isText = buf => !buf.subarray(0, 8000).includes(0);
 
 // --- what is checked: the index (a commit about to be made) or the working tree (tracked plus new files)
 
+// The content of a submodule or nested repository is another repository's: its path is listed so that links into
+// it resolve, and nothing under it is read.
+const SUBMODULE = Buffer.alloc(0);
+
 function readIndex(root) {
   // Entries are "<mode> <object> <stage>\t<path>"; blobs are asked for by object id, so no path is ever parsed
   // out of git's newline-framed batch output.
   const entries = git(root, ['ls-files', '-z', '--stage']).toString().split('\0').filter(Boolean)
-    .map(e => { const tab = e.indexOf('\t'); return { object: e.slice(0, tab).split(' ')[1], path: e.slice(tab + 1) }; })
+    .map(e => { const tab = e.indexOf('\t'); const [mode, object] = e.slice(0, tab).split(' '); return { mode, object, path: e.slice(tab + 1) }; })
     .filter((e, i, all) => all.findIndex(o => o.path === e.path) === i);
-  const out = git(root, ['cat-file', '--batch'], entries.map(e => `${e.object}\n`).join(''));
-  const files = new Map();
+  const blobs = entries.filter(e => e.mode !== '160000');
+  const out = git(root, ['cat-file', '--batch'], blobs.map(e => `${e.object}\n`).join(''));
+  const files = new Map(entries.filter(e => e.mode === '160000').map(e => [e.path, SUBMODULE]));
   let at = 0;
-  for (const { path: p } of entries) {
+  for (const { path: p } of blobs) {
     const nl = out.indexOf(10, at);
     const header = out.subarray(at, nl).toString();
     at = nl + 1;
@@ -193,16 +212,23 @@ function readTree(root) {
   const paths = git(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).toString().split('\0');
   const files = new Map();
   for (const p of new Set(paths.filter(Boolean))) {
-    // Git stores a symlink as its target's path, so that is what is checked; a folder (a nested repository, or a
-    // new symlink git lists as a path) has no content of its own.
+    // Git stores a symlink as its target's path, so that is what is checked. A folder is a submodule or a nested
+    // repository (git lists it with a trailing slash when untracked), so it is listed, not read.
+    if (throughLink(root, p)) continue; // a folder committed as a real one, now a link: reading it would leave the repository
     const abs = join(root, p);
     const st = lstatSync(abs, { throwIfNoEntry: false });
     if (!st) continue; // deleted in the working tree
     if (st.isSymbolicLink()) files.set(p, Buffer.from(readlinkSync(abs)));
     else if (st.isFile()) files.set(p, readFileSync(abs));
+    else if (st.isDirectory()) files.set(p.replace(/\/$/, ''), SUBMODULE);
   }
   return files;
 }
+// Whether a folder on the way to p is a link.
+const throughLink = (root, p) => {
+  const folders = p.split('/').slice(0, -1);
+  return folders.some((_, k) => lstatSync(join(root, ...folders.slice(0, k + 1)), { throwIfNoEntry: false })?.isSymbolicLink());
+};
 
 // --- the checks
 
@@ -279,7 +305,9 @@ function links(path, text, files, dirs, add) {
       try { target = decodeURIComponent(target); } catch { /* keep as written */ }
       const full = posix.normalize(posix.join(base, target)).replace(/\/$/, '');
       if (full.startsWith('..')) continue;
-      if (!files.has(full) && !dirs.has(full) && full !== '.') add(path, i + 1, `link to ${m[1]}, which isn't in the repository`);
+      const parts = full.split('/');
+      const inSubmodule = parts.some((_, k) => files.get(parts.slice(0, k + 1).join('/')) === SUBMODULE);
+      if (!files.has(full) && !dirs.has(full) && full !== '.' && !inSubmodule) add(path, i + 1, `link to ${m[1]}, which isn't in the repository`);
     }
   });
 }
@@ -377,9 +405,11 @@ function init(root) {
     .sort((a, b) => a.path.localeCompare(b.path));
   const config = { allow: [], allowPhrases: [], skip: [], dupSkip: [], allowLarge, keep: [], budgets: totals };
   writeFileSync(path, JSON.stringify(config, null, 2) + '\n', { flag: 'wx' });
-  installHook(root);
+  const hook = installHook(root);
   console.log(`unbloat-check: wrote ${path} (budgets: docs ${totals.docs}, instructions ${totals.instructions} lines)`);
-  return run(root, false);
+  // A hook that wasn't installed leaves the commits unchecked, so the init has not finished.
+  const status = run(root, false);
+  return hook === 'manual' ? 1 : status;
 }
 
 // Returns 'installed', 'current', or 'manual' (a hook the project owns, or one that can't be moved aside, needs a
@@ -411,7 +441,7 @@ function installHook(root, { quiet = false } = {}) {
 ${MARK}: runs the hook that was here before (pre-commit.local), if any,
 # then unbloat-check on what is about to be committed. Written by unbloat-check --install-hook.
 chained="$(dirname "$0")/pre-commit.local"
-if [ -x "$chained" ]; then "$chained" "$@" || exit $?; elif [ -f "$chained" ]; then sh "$chained" "$@" || exit $?; fi
+if [ -x "$chained" ]; then "$chained" "$@" || exit $?; fi
 installed=${shq(SELF.split('\\').join('/'))}
 script="\${UNBLOAT_CHECK:-$installed}"
 if [ -f "$script" ] && command -v node >/dev/null 2>&1; then
@@ -421,6 +451,11 @@ else
 fi
 exit 0
 `;
+  // A link is the project's: writing through it would write wherever it points, even outside the repository.
+  if (lstatSync(hook, { throwIfNoEntry: false })?.isSymbolicLink()) {
+    say(`unbloat-check: ${hook} is a link, which the project owns, so it is not rewritten; add this line to it: ${line}`);
+    return 'manual';
+  }
   if (existsSync(hook)) {
     const current = readFileSync(hook, 'utf8');
     if (current === body) return 'current';
@@ -443,8 +478,14 @@ exit 0
   chmodSync(hook, 0o755);
   return 'installed';
 }
-// Whether a hook runs the check: a line, not a comment, that calls the script with --staged.
-const runsCheck = hook => hook.split('\n').some(l => !/^\s*#/.test(l) && /(?:unbloat|lean)-check\.mjs.*--staged/.test(l));
+// Whether a hook runs the check: a top-level node or npx command that calls the script with --staged, before any
+// top-level exit. A comment, an echo or a line after the exit never runs it.
+const runsCheck = hook => {
+  const lines = hook.split('\n');
+  const exit = lines.findIndex(l => /^exit\b/.test(l));
+  return lines.slice(0, exit < 0 ? lines.length : exit)
+    .some(l => /^\s*(?:exec\s+)?(?:node|npx)\s/.test(l) && /(?:unbloat|lean)-check\.mjs.*--staged/.test(l));
+};
 // A single-quoted shell word: no expansion happens inside it.
 const shq = text => `'${text.replace(/'/g, `'\\''`)}'`;
 
@@ -600,13 +641,14 @@ const turnFile = (root, session) => resolve(root, git(root, ['rev-parse', '--git
   `unbloat-turn${session ? `-${String(session).replace(/[^\w-]/g, '_')}` : ''}.json`]).toString().trim());
 const hookSession = input => { try { return JSON.parse(input || '{}').session_id ?? ''; } catch { return ''; } };
 const zpaths = buf => buf.toString().split('\0').filter(Boolean);
+// Git's object id for a file's bytes. Hashed here, not by git hash-object: that would run the repository's clean
+// filters, and its stdin list breaks on a newline in a file name.
+const blobId = buf => createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
 // Each uncommitted path with its content hash ("" once deleted): what a turn found already changed.
 function dirtyNow(root) {
   const paths = [...new Set([...zpaths(git(root, ['diff', '-z', '--name-only', 'HEAD'])),
     ...zpaths(git(root, ['ls-files', '-z', '--others', '--exclude-standard']))])];
-  const present = paths.filter(p => existsSync(join(root, p)));
-  const hashes = present.length ? git(root, ['hash-object', '--stdin-paths'], present.join('\n') + '\n').toString().split('\n') : [];
-  return Object.fromEntries(paths.map(p => [p, present.includes(p) ? hashes[present.indexOf(p)] : '']));
+  return Object.fromEntries(paths.map(p => [p, existsSync(join(root, p)) ? blobId(readFileSync(join(root, p))) : '']));
 }
 const head = root => { try { return git(root, ['rev-parse', 'HEAD']).toString().trim(); } catch { return null; } };
 const hookCwd = input => { try { return JSON.parse(input || '{}').cwd ?? process.cwd(); } catch { return process.cwd(); } };
@@ -628,6 +670,12 @@ function stop(input) {
   let recorded = false;
   try { turn = { ...turn, ...JSON.parse(readFileSync(record, 'utf8')) }; recorded = true; } catch { /* no record: changes since HEAD */ }
   if (turn.sends >= MAX_SENDS) return 0;
+  // Every block counts as a send, including a broken config, so a turn can't be held open forever.
+  const send = reason => {
+    writeFileSync(record, JSON.stringify({ ...turn, sends: turn.sends + 1 }) + '\n');
+    console.log(JSON.stringify({ decision: 'block', reason }));
+    return 0;
+  };
   // A turn that began before the first commit counts everything it committed: diff from the empty tree.
   const base = turn.base ?? (recorded ? EMPTY_TREE : head(root));
   const now = (() => { try { return head(root) ? dirtyNow(root) : {}; } catch { return {}; } })();
@@ -639,21 +687,17 @@ function stop(input) {
   if (changed.size === 0) return 0;
   let config;
   try { config = loadConfig(readConfig(root), CONFIG); } catch (e) {
-    console.log(JSON.stringify({ decision: 'block', reason: `unbloat-check: ${e.message}. Fix the config before you finish.` }));
-    return 0;
+    return send(`unbloat-check: ${e.message}. Fix the config before you finish.`);
   }
   const { problems } = check(readTree(root), config);
   // Problems in what the turn touched, and the config's own (budgets, exceptions): both fail the next commit.
   // A repeated sentence is reported at its first place, so the copies it names count too.
   const mine = problems.filter(p => p.path === CONFIG || changed.has(p.path) || [...changed].some(c => p.text.includes(` ${c}:`)));
   if (mine.length === 0) return 0;
-  writeFileSync(record, JSON.stringify({ ...turn, sends: turn.sends + 1 }) + '\n');
   const list = mine.slice(0, 20).map(p => `- ${p.path}${p.line ? `:${p.line}` : ''}: ${p.text}`).join('\n');
   const more = mine.length > 20 ? `\n- and ${mine.length - 20} more (run unbloat-check)` : '';
-  const reason = `unbloat-check: what this turn changed in ${root} has ${mine.length} problem(s) the next commit would ` +
-    `fail on. Fix them before you finish; an exception is only for product files or wording, with its reason.\n${list}${more}`;
-  console.log(JSON.stringify({ decision: 'block', reason }));
-  return 0;
+  return send(`unbloat-check: what this turn changed in ${root} has ${mine.length} problem(s) the next commit would ` +
+    `fail on. Fix them before you finish; an exception is only for product files or wording, with its reason.\n${list}${more}`);
 }
 
 // Ignored and untracked build-up: caches, scratch and output folders, by size and age. Reports; never deletes.

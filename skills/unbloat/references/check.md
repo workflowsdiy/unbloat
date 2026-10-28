@@ -8,7 +8,7 @@ Run it from the repository you're checking, by the path where the skill is insta
 `node ~/.agents/skills/unbloat/scripts/unbloat-check.mjs`; shortened to `unbloat-check.mjs` below).
 
 ```bash
-node unbloat-check.mjs --init          # opt in: writes .unbloat.json, installs the hook, checks (exit 1 while problems remain)
+node unbloat-check.mjs --init          # opt in: writes .unbloat.json, installs the hook, checks (exit 1 while problems remain or the hook isn't installed)
 node unbloat-check.mjs                 # check the working tree (tracked and new files)
 node unbloat-check.mjs --staged        # what the pre-commit hook runs: the index
 node unbloat-check.mjs --disk          # ignored/untracked build-up by size and age; deletes nothing
@@ -55,8 +55,8 @@ Every exception is an object with a `reason` saying why it is product, not proce
 
 Paths are globs relative to the repository root: `*` matches within one folder, `**/` any number of folders, and
 `docs/**` everything under `docs/`. A `keep` path to a folder needs no trailing slash. An `allowPhrases`
-pattern is a regular expression; one with a repeated group inside a repeated group, such as `(a+)+`, is refused
-because it can hang the check.
+pattern is a regular expression; a repeated group that holds alternation, a repeat or another group, such as
+`(a+)+` or `(x|xx)+`, is refused because it can hang the check.
 
 ## The write guard
 
@@ -90,9 +90,9 @@ the script's absolute path where you installed the skill:
 }
 ```
 
-Where `core.hooksPath` points into the repository (husky, `.githooks/`), that hook belongs to the project and
-is never rewritten: `--install-hook` prints the line to add to it instead, and exits 1. Otherwise an existing
-hook moves to `pre-commit.local` and runs first, so anything it stages is checked too. The pre-commit hook calls this script by its absolute
-path; set `UNBLOAT_CHECK` to override it, for example where the script lives elsewhere on another machine.
+Where `core.hooksPath` points into the repository (husky, `.githooks/`), or `pre-commit` is a link, that hook belongs
+to the project: it is never rewritten, and `--install-hook` prints the line to add to it and exits 1. Otherwise an
+existing hook moves to `pre-commit.local` and runs first if it is executable, so anything it stages is checked too.
+The pre-commit hook calls this script by its absolute path; set `UNBLOAT_CHECK` to override it.
 If Node or the script is missing, the hook warns and lets the commit through, so a moved or updated install
 never blocks every commit; the next session start reinstalls it.

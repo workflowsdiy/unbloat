@@ -1,7 +1,7 @@
 // node --test: unbloat-check against throwaway git repositories.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -15,6 +15,11 @@ const git = (cwd, ...args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
 const temps = [];
 const temp = prefix => { const dir = mkdtempSync(join(tmpdir(), prefix)); temps.push(dir); return dir; };
 after(() => { for (const dir of temps) rmSync(dir, { recursive: true, force: true }); });
+
+// A symlink for a test that needs one. Where the system can't make one, the test is skipped, not passed.
+function link(t, target, path) {
+  try { symlinkSync(target, path); return true; } catch { t.skip('this system cannot make symlinks'); return false; }
+}
 
 function repo(files, config = { budgets: {} }, name = '.unbloat.json') {
   const dir = temp('unbloat-check-');
@@ -243,14 +248,25 @@ test('--disk leaves out the config; a hooks folder tracked in the repository is 
   assert.ok(!existsSync(join(dir, '.husky/pre-commit.local')));
 });
 
-test('the installed hook still runs a moved-aside hook that is not executable', () => {
+test('the installed hook still runs a moved-aside hook that is executable', () => {
   const dir = repo({ 'README.md': 'x\n' });
   writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo chained-hook-ran >&2\nexit 1\n');
+  chmodSync(join(dir, '.git/hooks/pre-commit'), 0o755);
   check(dir, ['--install-hook']);
   git(dir, 'add', '-A');
   const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
   assert.notEqual(commit.status, 0);
   assert.match(commit.stderr, /chained-hook-ran/);
+});
+
+test('a moved-aside hook that is not executable does not run, as git would not run it', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo chained-hook-ran >&2\nexit 1\n');
+  check(dir, ['--install-hook']);
+  git(dir, 'add', '-A');
+  const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
+  assert.equal(commit.status, 0, commit.stderr);
+  assert.doesNotMatch(commit.stderr, /chained-hook-ran/);
 });
 
 test('the end-of-turn gate sends back only problems the turn brought, at most twice a turn', () => {
@@ -377,6 +393,7 @@ test('templates and components with process-sounding names are product', () => {
 test('a hook moved aside runs first, so what it stages is checked too', () => {
   const dir = repo({ 'README.md': 'x\n' });
   writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo x > PLAN.md\ngit add PLAN.md\n');
+  chmodSync(join(dir, '.git/hooks/pre-commit'), 0o755);
   check(dir, ['--install-hook']);
   git(dir, 'add', '-A');
   const commit = spawnSync('git', ['commit', '-q', '-m', 'x'], { cwd: dir, encoding: 'utf8' });
@@ -412,12 +429,12 @@ test('config and links: allowPhrases paths must be a list; an encoded # in a lin
   assert.equal(check(repo({ 'README.md': '[x](a%23b.md)\n', 'a#b.md': 'x\n' })).status, 0);
 });
 
-test('--disk: a scratch folder holding a model folder is opened up, and a dangling link does not crash it', () => {
+test('--disk: a scratch folder holding a model folder is opened up, and a dangling link does not crash it', t => {
   const dir = repo({ '.gitignore': '.scratch/\nlink\n', 'README.md': 'x\n' });
   mkdirSync(join(dir, '.scratch/job/models'), { recursive: true });
   writeFileSync(join(dir, '.scratch/job/models/model.bin'), 'w');
   writeFileSync(join(dir, '.scratch/job/out.txt'), 'o');
-  spawnSync('ln', ['-s', join(dir, 'missing'), join(dir, 'link')]);
+  if (!link(t, join(dir, 'missing'), join(dir, 'link'))) return;
   const r = check(dir, ['--disk']);
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /\.scratch\/job\/\s*$/m);
@@ -432,10 +449,10 @@ test('a sentence repeated across wrapped lines is found, at the line it starts o
   assert.match(r.stderr, /README\.md:1: the same sentence is also at docs\/a\.md:3/);
 });
 
-test('an untracked symlink to a folder, as the skills CLI installs, is read as a link, not a file', () => {
+test('an untracked symlink to a folder, as the skills CLI installs, is read as a link, not a file', t => {
   const dir = repo({ '.agents/skills/x/SKILL.md': 'x\n' });
   mkdirSync(join(dir, '.claude/skills'), { recursive: true });
-  spawnSync('ln', ['-s', '../../.agents/skills/x', join(dir, '.claude/skills/x')]);
+  if (!link(t, '../../.agents/skills/x', join(dir, '.claude/skills/x'))) return;
   const r = check(dir);
   assert.equal(r.status, 0, r.stderr);
 });
@@ -526,4 +543,94 @@ test('security review: --init never writes through a config link, and control ch
   const r = check(repo({ 'notes/review-\x1b]52;c;aGk=\x07.md': 'x\n' }));
   assert.doesNotMatch(r.stderr, /\x1b/);
   assert.match(r.stderr, /\\x1b\]52/);
+});
+
+test('a malformed config is sent back at most twice a turn, like any other problem', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  git(dir, 'commit', '-q', '-m', 'start');
+  const hook = flag => check(dir, [flag], JSON.stringify({ cwd: dir })).stdout;
+  hook('--turn-start');
+  writeFileSync(join(dir, '.unbloat.json'), '{');
+  writeFileSync(join(dir, 'docs.md'), 'x\n');
+  assert.match(JSON.parse(hook('--stop')).reason, /must be|Unexpected|JSON/);
+  assert.equal(JSON.parse(hook('--stop')).decision, 'block');
+  assert.equal(hook('--stop'), ''); // the turn's two sends are used up
+});
+
+test('--init exits 1 when the hook cannot be installed, and still checks the repository', () => {
+  const shared = temp('unbloat-shared-');
+  const dir = temp('unbloat-check-');
+  git(dir, 'init', '-q');
+  git(dir, 'config', 'core.hooksPath', shared);
+  const r = check(dir, ['--init']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /outside this repository/);
+  assert.ok(!existsSync(join(shared, 'pre-commit')));
+});
+
+test('a link into a submodule resolves: the submodule is another repository, so its files are not read', () => {
+  const dir = repo({ 'README.md': '[guide](sub/guide.md)\n' });
+  git(dir, 'commit', '-q', '-m', 'start');
+  const head = git(dir, 'rev-parse', 'HEAD').stdout.trim();
+  git(dir, 'update-index', '--add', '--cacheinfo', `160000,${head},sub`);
+  mkdirSync(join(dir, 'sub'));
+  writeFileSync(join(dir, 'sub/.git'), 'gitdir: /nowhere\n');
+  writeFileSync(join(dir, 'sub/guide.md'), 'x\n');
+  const tree = check(dir);
+  assert.equal(tree.status, 0, tree.stderr);
+  git(dir, 'commit', '-q', '-m', 'add the submodule');
+  const index = check(dir, ['--staged']);
+  assert.equal(index.status, 0, index.stderr);
+});
+
+test('--install-hook never writes through a link: a dangling or existing link target outside the repository is left alone', t => {
+  const outside = temp('unbloat-outside-');
+  const dangling = join(outside, 'made-by-hook');
+  const dir = repo({ 'README.md': 'x\n' });
+  if (!link(t, dangling, join(dir, '.git/hooks/pre-commit'))) return;
+  assert.equal(check(dir, ['--install-hook']).status, 1);
+  assert.ok(!existsSync(dangling));
+  const existing = join(outside, 'kept');
+  writeFileSync(existing, '# unbloat-check pre-commit hook\nkept\n');
+  const other = repo({ 'README.md': 'x\n' });
+  symlinkSync(existing, join(other, '.git/hooks/pre-commit'));
+  assert.equal(check(other, ['--install-hook']).status, 1);
+  assert.equal(readFileSync(existing, 'utf8'), '# unbloat-check pre-commit hook\nkept\n');
+});
+
+test('a tracked file under a folder that is now a link is not read from outside the repository', t => {
+  const dir = repo({ 'docs/notes.md': 'x\n' });
+  git(dir, 'commit', '-q', '-m', 'start');
+  const outside = temp('unbloat-outside-');
+  writeFileSync(join(outside, 'notes.md'), 'Fixed in round 3.\n');
+  rmSync(join(dir, 'docs'), { recursive: true });
+  if (!link(t, outside, join(dir, 'docs'))) return;
+  const r = check(dir);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test('a file whose name holds a newline is one file to the end-of-turn gate', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  git(dir, 'commit', '-q', '-m', 'start');
+  writeFileSync(join(dir, 'pre\nexisting.md'), 'Fixed in round 3.\n'); // changed before the turn: not this turn's
+  const hook = flag => check(dir, [flag], JSON.stringify({ cwd: dir })).stdout;
+  hook('--turn-start');
+  assert.equal(hook('--stop'), '');
+});
+
+
+test('a user regex that can backtrack exponentially is refused rather than run', () => {
+  const dir = repo({ 'README.md': `${'x'.repeat(30)}!\n` }, { allowPhrases: [{ pattern: '(x|xx)+y', reason: 'r' }] });
+  const started = Date.now();
+  const r = check(dir);
+  assert.match(r.stderr, /can hang the check/);
+  assert.ok(Date.now() - started < 5000);
+});
+
+test('a hook that only names the check in an echo, or after an exit, is not current', () => {
+  const dir = repo({ 'README.md': 'x\n', '..hooks/pre-commit': 'echo "node tools/unbloat-check.mjs --staged"\n' });
+  git(dir, 'config', 'core.hooksPath', '..hooks');
+  assert.equal(check(dir, ['--install-hook']).status, 1);
+  writeFileSync(join(dir, '..hooks/pre-commit'), 'exit 0\nnode tools/unbloat-check.mjs --staged\n');
+  assert.equal(check(dir, ['--install-hook']).status, 1);
 });
