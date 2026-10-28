@@ -250,7 +250,7 @@ test('--disk leaves out the config; a hooks folder tracked in the repository is 
 
 test('the installed hook still runs a moved-aside hook that is executable', () => {
   const dir = repo({ 'README.md': 'x\n' });
-  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo chained-hook-ran >&2\nexit 1\n');
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), '#!/bin/sh\necho chained-hook-ran >&2\nexit 1\n');
   chmodSync(join(dir, '.git/hooks/pre-commit'), 0o755);
   check(dir, ['--install-hook']);
   git(dir, 'add', '-A');
@@ -392,7 +392,7 @@ test('templates and components with process-sounding names are product', () => {
 
 test('a hook moved aside runs first, so what it stages is checked too', () => {
   const dir = repo({ 'README.md': 'x\n' });
-  writeFileSync(join(dir, '.git/hooks/pre-commit'), 'echo x > PLAN.md\ngit add PLAN.md\n');
+  writeFileSync(join(dir, '.git/hooks/pre-commit'), '#!/bin/sh\necho x > PLAN.md\ngit add PLAN.md\n');
   chmodSync(join(dir, '.git/hooks/pre-commit'), 0o755);
   check(dir, ['--install-hook']);
   git(dir, 'add', '-A');
@@ -609,7 +609,8 @@ test('a tracked file under a folder that is now a link is not read from outside 
   assert.equal(r.status, 0, r.stderr);
 });
 
-test('a file whose name holds a newline is one file to the end-of-turn gate', () => {
+test('a file whose name holds a newline is one file to the end-of-turn gate', t => {
+  if (process.platform === 'win32') { t.skip('Windows filenames cannot contain newlines'); return; }
   const dir = repo({ 'README.md': 'x\n' });
   git(dir, 'commit', '-q', '-m', 'start');
   writeFileSync(join(dir, 'pre\nexisting.md'), 'Fixed in round 3.\n'); // changed before the turn: not this turn's
