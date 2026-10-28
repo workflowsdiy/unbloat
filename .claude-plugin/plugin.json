@@ -1,6 +1,6 @@
 {
   "name": "unbloat",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Clean up what your coding agent left behind (dead code, stale docs, bloated agent instructions, plans and reports) and keep it from coming back with a pre-commit gate, a write guard and an end-of-turn gate.",
   "icon": ".claude-plugin/icon.png",
   "author": {
