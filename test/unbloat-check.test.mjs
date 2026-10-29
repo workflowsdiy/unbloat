@@ -1,15 +1,16 @@
 // node --test: unbloat-check against throwaway git repositories.
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'unbloat', 'scripts', 'unbloat-check.mjs');
-const check = (cwd, args = [], input) => spawnSync(process.execPath, [SCRIPT, ...args], { cwd, input, encoding: 'utf8' });
+const check = (cwd, args = [], input, options = {}) => spawnSync(process.execPath, [SCRIPT, ...args], { cwd, input, encoding: 'utf8', ...options });
 const git = (cwd, ...args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+const CLI_LIMIT = { timeout: 2000, killSignal: 'SIGKILL' };
 
 // Every temporary folder the suite makes is removed when it ends.
 const temps = [];
@@ -686,6 +687,110 @@ test('ratcheting replaces the config without modifying another hard link to it',
   assert.equal(r.status, 0, r.stderr);
   assert.equal(JSON.parse(readFileSync(copy, 'utf8')).budgets.docs, 999);
   assert.equal(JSON.parse(git(dir, 'show', ':.unbloat.json').stdout).budgets.docs, 1);
+});
+
+test('configured scanner globs have a deadline in worktree and staged modes', () => {
+  const slow = 'a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b', stem = 'a'.repeat(64);
+  for (const [list, ext, text] of [
+    ['skip', '.txt', 'x\n'], ['allow', '.log', 'x\n'], ['dupSkip', '.md', 'x\n'],
+    ['allowLarge', '.txt', 'x'.repeat(512 * 1024 + 1)], ['allowPhrases', '.md', 'after the review\n']
+  ]) {
+    const entry = list === 'allowPhrases' ? { pattern: 'after the review', paths: [slow], reason: 'fixture' } : { path: slow, reason: 'fixture' };
+    const dir = repo({ [stem + ext]: text }, { [list]: [entry] });
+    for (const args of [[], ['--staged']]) {
+      const r = check(dir, args, undefined, CLI_LIMIT);
+      assert.ifError(r.error);
+      assert.equal(r.status, 1, `${list}: ${r.stderr}`);
+      assert.match(r.stderr, /path glob matching exceeded 100 ms/);
+    }
+  }
+});
+
+test('configured guard and disk globs have the same deadline', () => {
+  const slow = 'a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b', stem = 'a'.repeat(64);
+  const guarded = repo({ 'README.md': 'x\n' }, { allow: [{ path: slow, reason: 'fixture' }] });
+  const input = JSON.stringify({ cwd: guarded, tool_name: 'Write', tool_input: { file_path: join(guarded, `${stem}.log`) } });
+  const guard = check(guarded, ['--guard'], input, CLI_LIMIT);
+  assert.ifError(guard.error);
+  assert.equal(guard.status, 1, guard.stderr);
+  assert.match(guard.stderr, /path glob matching exceeded 100 ms/);
+  const disk = repo({ 'README.md': 'x\n', '.gitignore': '*.tmp\n' }, { keep: [{ path: slow, reason: 'fixture' }] });
+  writeFileSync(join(disk, `${stem}.tmp`), 'x\n');
+  const r = check(disk, ['--disk'], undefined, CLI_LIMIT);
+  assert.ifError(r.error);
+  assert.equal(r.status, 1, r.stderr);
+  assert.match(r.stderr, /path glob matching exceeded 100 ms/);
+});
+
+test('turn hooks hash symlink text without reading the outside file or a FIFO target', t => {
+  const dir = repo({ 'README.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-qm', 'start').status, 0);
+  const target = join(temp('unbloat-outside-'), 'dummy.txt'), leaf = join(dir, 'linked.txt');
+  writeFileSync(target, 'dummy content\n');
+  if (!link(t, target, leaf)) return;
+  const targetText = readlinkSync(leaf);
+  const expected = spawnSync('git', ['hash-object', '--stdin'], { cwd: dir, input: targetText, encoding: 'utf8' });
+  assert.equal(expected.status, 0, expected.stderr);
+  const input = JSON.stringify({ cwd: dir, session_id: 'link-read' });
+  const started = check(dir, ['--turn-start'], input, CLI_LIMIT);
+  assert.ifError(started.error);
+  assert.equal(started.status, 0, started.stderr);
+  const record = () => JSON.parse(readFileSync(join(dir, '.git/unbloat-turn-link-read.json'), 'utf8'));
+  assert.equal(record().dirty['linked.txt'], expected.stdout.trim());
+  writeFileSync(target, 'changed outside content\n');
+  const stopped = check(dir, ['--stop'], input, CLI_LIMIT);
+  assert.ifError(stopped.error);
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.equal(stopped.stdout, '');
+  if (process.platform !== 'win32') {
+    rmSync(target);
+    const fifo = spawnSync('mkfifo', [target], { encoding: 'utf8' });
+    assert.equal(fifo.status, 0, fifo.stderr);
+    for (const flag of ['--turn-start', '--stop']) {
+      const r = check(dir, [flag], input, CLI_LIMIT);
+      assert.ifError(r.error);
+      assert.equal(r.status, 0, r.stderr);
+    }
+    assert.equal(record().dirty['linked.txt'], expected.stdout.trim());
+  }
+});
+
+test('turn hooks skip tracked paths whose parent directory became a symlink', t => {
+  const dir = repo({ 'docs/notes.txt': 'x\n' });
+  assert.equal(git(dir, 'commit', '-qm', 'start').status, 0);
+  const outside = temp('unbloat-outside-');
+  writeFileSync(join(outside, 'notes.txt'), 'outside dummy\n');
+  rmSync(join(dir, 'docs'), { recursive: true });
+  if (!link(t, outside, join(dir, 'docs'))) return;
+  const input = JSON.stringify({ cwd: dir, session_id: 'parent-link' });
+  const r = check(dir, ['--turn-start'], input, CLI_LIMIT);
+  assert.ifError(r.error);
+  assert.equal(r.status, 0, r.stderr);
+  const state = JSON.parse(readFileSync(join(dir, '.git/unbloat-turn-parent-link.json'), 'utf8'));
+  assert.equal(state.dirty['docs/notes.txt'], '');
+  const stopped = check(dir, ['--stop'], input, CLI_LIMIT);
+  assert.ifError(stopped.error);
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.equal(stopped.stdout, '');
+});
+
+test('--changes escapes controls in exception reasons, commit subjects and snapshot metadata', () => {
+  const dir = repo({ 'README.md': 'x\n' }, { budgets: { docs: 1 } });
+  const snapshot = join(temp('unbloat-snapshot-'), 'snapshot.json');
+  assert.equal(check(dir, [`--changes=${snapshot}`, '--save']).status, 0);
+  const before = JSON.parse(readFileSync(snapshot, 'utf8'));
+  before.saved = '\x1b[33msnapshot\x07';
+  writeFileSync(snapshot, JSON.stringify(before));
+  writeFileSync(join(dir, '.unbloat.json'), JSON.stringify({
+    allow: [{ path: '*.log', reason: '\x1b[31mreason\x07' }], budgets: { docs: 2 }
+  }));
+  assert.equal(git(dir, 'add', '.unbloat.json').status, 0);
+  const committed = git(dir, 'commit', '-qm', '\x1b[32msubject\x07');
+  assert.equal(committed.status, 0, committed.stderr);
+  const r = check(dir, [`--changes=${snapshot}`]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.stdout, /[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+  for (const text of ['\\x1b[31mreason\\x07', '\\x1b[32msubject\\x07', '\\x1b[33msnapshot\\x07']) assert.ok(r.stdout.includes(text), r.stdout);
 });
 
 test('a hook that only names the check in an echo, or after an exit, is not current', () => {

@@ -108,7 +108,26 @@ function glob(pattern, flags = 'i') {
   }
   return new RegExp(`^${re}$`, flags);
 }
-const matcher = (patterns, flags) => { const res = patterns.map(p => glob(p, flags)); return path => res.some(r => r.test(path)); };
+// Only this fixed expression runs in the VM; repository patterns remain data.
+const patternTest = new Script('patterns.some(re => re.test(value))');
+function boundedMatch(label) {
+  const context = createContext({ patterns: [], value: '' });
+  return (value, patterns) => {
+    if (patterns.length === 0) return false;
+    context.value = value;
+    context.patterns = patterns;
+    try { return patternTest.runInContext(context, { timeout: 100 }); }
+    catch (e) {
+      if (e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`${CONFIG}: ${label} matching exceeded 100 ms; simplify the patterns`);
+      throw e;
+    }
+  };
+}
+const matcher = (patterns, flags, bounded = false) => {
+  const res = patterns.map(p => glob(p, flags));
+  const test = bounded && res.length ? boundedMatch('path glob') : null;
+  return path => test ? test(path, res) : res.some(r => r.test(path));
+};
 const processDoc = matcher(PROCESS_DOCS);
 const processName = ((names, folders) => path => (names(path) && RECORD_EXT.test(path)) || (folders(path) && NOTE_EXT.test(path)))(
   matcher(PROCESS_NAMES), matcher(PROCESS_FOLDERS));
@@ -212,19 +231,21 @@ function readIndex(root) {
   return files;
 }
 
+// A link contributes its target text, never the referent; linked parents and special files are not read.
+function treeBytes(root, p) {
+  if (throughLink(root, p)) return null;
+  const abs = join(root, p), st = lstatSync(abs, { throwIfNoEntry: false });
+  if (st?.isSymbolicLink()) return Buffer.from(readlinkSync(abs));
+  if (st?.isFile()) return readFileSync(abs);
+  return st?.isDirectory() ? SUBMODULE : null;
+}
+
 function readTree(root) {
   const paths = git(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']).toString().split('\0');
   const files = new Map();
   for (const p of new Set(paths.filter(Boolean))) {
-    // Git stores a symlink as its target's path, so that is what is checked. A folder is a submodule or a nested
-    // repository (git lists it with a trailing slash when untracked), so it is listed, not read.
-    if (throughLink(root, p)) continue; // a folder committed as a real one, now a link: reading it would leave the repository
-    const abs = join(root, p);
-    const st = lstatSync(abs, { throwIfNoEntry: false });
-    if (!st) continue; // deleted in the working tree
-    if (st.isSymbolicLink()) files.set(p, Buffer.from(readlinkSync(abs)));
-    else if (st.isFile()) files.set(p, readFileSync(abs));
-    else if (st.isDirectory()) files.set(p.replace(/\/$/, ''), SUBMODULE);
+    const buf = treeBytes(root, p);
+    if (buf !== null) files.set(buf === SUBMODULE ? p.replace(/\/$/, '') : p, buf);
   }
   return files;
 }
@@ -240,25 +261,14 @@ function check(files, config) {
   const problems = [];
   const add = (path, line, text) => problems.push({ path, line, text });
   exceptionProblems(config, add);
-  const allowed = matcher(globs(config, 'allow')), licence = matcher(LICENCES, '');
-  const skipped = (m => path => licence(path) || m(path))(matcher([...SKIP, ...globs(config, 'skip')]));
-  const dupSkipped = matcher(globs(config, 'dupSkip')), large = matcher(globs(config, 'allowLarge'));
+  const allowed = matcher(globs(config, 'allow'), 'i', true), licence = matcher(LICENCES, '');
+  const skipped = (m => path => licence(path) || m(path))(matcher([...SKIP, ...globs(config, 'skip')], 'i', config.skip.length > 0));
+  const dupSkipped = matcher(globs(config, 'dupSkip'), 'i', true), large = matcher(globs(config, 'allowLarge'), 'i', true);
   const recordFile = matcher(RECORD_FILES), instruction = matcher(INSTRUCTIONS, '');
   const waivers = config.allowPhrases.filter(w => w && typeof w.pattern === 'string')
-    .map(w => ({ re: new RegExp(w.pattern, 'i'), paths: matcher(w.paths ?? ['**']) }));
-  // Only this fixed expression runs in the VM; patterns remain data. The deadline bounds native regex work.
-  const waiverContext = createContext({ patterns: [], line: '' });
-  const waiverTest = new Script('patterns.some(re => re.test(line))');
-  const waived = (path, line) => {
-    waiverContext.patterns = waivers.filter(w => w.paths(path)).map(w => w.re);
-    if (waiverContext.patterns.length === 0) return false;
-    waiverContext.line = line;
-    try { return waiverTest.runInContext(waiverContext, { timeout: 100 }); }
-    catch (e) {
-      if (e.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') throw new Error(`${CONFIG}: allowPhrases matching exceeded 100 ms; simplify the patterns`);
-      throw e;
-    }
-  };
+    .map(w => ({ re: new RegExp(w.pattern, 'i'), paths: matcher(w.paths ?? ['**'], 'i', true) }));
+  const waiverTest = boundedMatch('allowPhrases');
+  const waived = (path, line) => waiverTest(line, waivers.filter(w => w.paths(path)).map(w => w.re));
   const dirs = new Set();
   for (const p of files.keys()) for (let d = posix.dirname(p); d !== '.'; d = posix.dirname(d)) dirs.add(d);
   const sentences = new Map();
@@ -554,8 +564,8 @@ function guard(input) {
     let config;
     try { config = loadConfig(readConfig(root), CONFIG); } catch { config = loadConfig('{}', CONFIG); } // allow nothing
     const rel = relative(root, abs).split('\\').join('/');
-    if (processDoc(rel) || (processName(rel) && !matcher(globs(config, 'allow'))(rel))) reason = `unbloat-check: ${rel} is a process file: ${WHY_FILE}.`;
-    else if (matcher(RECORD_FILES)(rel) && !matcher(globs(config, 'allow'))(rel)) reason = `unbloat-check: ${rel} looks like a run record: ${WHY_FILE}.`;
+    if (processDoc(rel) || (processName(rel) && !matcher(globs(config, 'allow'), 'i', true)(rel))) reason = `unbloat-check: ${rel} is a process file: ${WHY_FILE}.`;
+    else if (matcher(RECORD_FILES)(rel) && !matcher(globs(config, 'allow'), 'i', true)(rel)) reason = `unbloat-check: ${rel} looks like a run record: ${WHY_FILE}.`;
   }
   if (reason) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }));
   return 0;
@@ -672,7 +682,7 @@ const blobId = buf => createHash('sha1').update(`blob ${buf.length}\0`).update(b
 function dirtyNow(root) {
   const paths = [...new Set([...zpaths(git(root, ['diff', '-z', '--name-only', 'HEAD'])),
     ...zpaths(git(root, ['ls-files', '-z', '--others', '--exclude-standard']))])];
-  return Object.fromEntries(paths.map(p => [p, existsSync(join(root, p)) ? blobId(readFileSync(join(root, p))) : '']));
+  return Object.fromEntries(paths.map(p => { const buf = treeBytes(root, p); return [p, buf === null ? '' : blobId(buf)]; }));
 }
 const head = root => { try { return git(root, ['rev-parse', 'HEAD']).toString().trim(); } catch { return null; } };
 const hookCwd = input => { try { return JSON.parse(input || '{}').cwd ?? process.cwd(); } catch { return process.cwd(); } };
@@ -735,7 +745,7 @@ function disk(root) {
   const kept = config.keep.filter(e => e && typeof e.path === 'string').map(e => {
     const path = !/[*?]/.test(e.path) && !e.path.endsWith('/') && lstatSync(join(root, e.path), { throwIfNoEntry: false })?.isDirectory()
       ? `${e.path}/` : e.path;
-    return { ...e, path, is: matcher([path]) };
+    return { ...e, path, is: matcher([path], 'i', true) };
   });
   const keepOf = rel => kept.find(k => k.is(rel));
   const keep = rel => env(rel) || keepOf(rel) !== undefined;
@@ -831,12 +841,12 @@ function changes(roots, file, save) {
     }
     added += rows.filter(r => r.startsWith('  new')).length;
     raised += rows.filter(r => r.startsWith('  raised') || r.startsWith('  removed')).length;
-    if (rows.length > 0) console.log(`--- ${root}\n${rows.join('\n')}`);
+    if (rows.length > 0) console.log(shown(`--- ${root}\n${rows.join('\n')}`));
   }
   if (save) {
     writeFileSync(file, `${JSON.stringify({ saved: new Date().toISOString(), repos: now }, null, 2)}\n`);
-    console.log(`unbloat-check: saved the exceptions and budgets of ${roots.length} repositories to ${file}`);
-  } else console.log(`unbloat-check: ${added} new exception(s), ${raised} raised or removed budget(s) since ${before.saved ?? 'no snapshot'}`);
+    console.log(shown(`unbloat-check: saved the exceptions and budgets of ${roots.length} repositories to ${file}`));
+  } else console.log(shown(`unbloat-check: ${added} new exception(s), ${raised} raised or removed budget(s) since ${before.saved ?? 'no snapshot'}`));
   return 0;
 }
 

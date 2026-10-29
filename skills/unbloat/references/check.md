@@ -55,8 +55,8 @@ Every exception is an object with a `reason` saying why it is product, not proce
 
 Paths are globs relative to the repository root: `*` matches within one folder, `**/` any number of folders, and
 `docs/**` everything under `docs/`. A `keep` path to a folder needs no trailing slash. An `allowPhrases`
-pattern is a regular expression; repeated groups holding alternation or nested repeats are refused. Matching
-applicable waivers against a flagged line has a 100 ms deadline; exceeding it fails the check.
+pattern is a regular expression; repeated groups holding alternation or nested repeats are refused. Configured
+glob matching and waiver evaluation each have a 100 ms deadline; exceeding it fails the command.
 
 ## The write guard
 
