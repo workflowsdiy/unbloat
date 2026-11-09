@@ -1,8 +1,8 @@
 // node --test: unbloat-check against throwaway git repositories.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -689,7 +689,7 @@ test('ratcheting replaces the config without modifying another hard link to it',
   assert.equal(JSON.parse(git(dir, 'show', ':.unbloat.json').stdout).budgets.docs, 1);
 });
 
-test('configured scanner globs have a deadline in worktree and staged modes', () => {
+test('pathological configured globs match by a bounded scan in every mode', () => {
   const slow = 'a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b', stem = 'a'.repeat(64);
   for (const [list, ext, text] of [
     ['skip', '.txt', 'x\n'], ['allow', '.log', 'x\n'], ['dupSkip', '.md', 'x\n'],
@@ -700,26 +700,47 @@ test('configured scanner globs have a deadline in worktree and staged modes', ()
     for (const args of [[], ['--staged']]) {
       const r = check(dir, args, undefined, CLI_LIMIT);
       assert.ifError(r.error);
-      assert.equal(r.status, 1, `${list}: ${r.stderr}`);
-      assert.match(r.stderr, /path glob matching exceeded 100 ms/);
+      assert.doesNotMatch(r.stderr, /matching exceeded/, `${list}: ${r.stderr}`);
     }
   }
 });
 
-test('configured guard and disk globs have the same deadline', () => {
+test('glob matching keeps its meaning: one folder, any folders, single character, case folding', () => {
+  const dir = repo({ 'docs/a/b/notes.log': 'x\n', 'top.log': 'x\n', 'Docs/x.LOG': 'x\n', 'other/z.log': 'x\n', 'stop.log': 'x\n' },
+    { allow: [{ path: 'docs/**/*.log', reason: 'r' }, { path: '?op.log', reason: 'r' }, { path: 'docs/*.log', reason: 'r' }] });
+  const r = check(dir);
+  assert.doesNotMatch(r.stderr, /docs\/a\/b\/notes\.log|[^s]top\.log|Docs\/x\.LOG/, r.stderr);
+  assert.match(r.stderr, /other\/z\.log/);
+  assert.match(r.stderr, /stop\.log/);
+});
+
+test('glob matching stays fast while the machine is loaded', () => {
+  const busy = Array.from({ length: Math.max(2, availableParallelism()) }, () =>
+    spawn(process.execPath, ['-e', 'const end = Date.now() + 8000; while (Date.now() < end) {}'], { stdio: 'ignore' }));
+  try {
+    const slow = 'a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b';
+    const files = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`${'a'.repeat(64)}${i}.txt`, 'x\n']));
+    const dir = repo(files, { skip: [{ path: slow, reason: 'fixture' }] });
+    const r = check(dir, [], undefined, { timeout: 15000, killSignal: 'SIGKILL' });
+    assert.ifError(r.error);
+    assert.doesNotMatch(r.stderr, /matching exceeded/, r.stderr);
+  } finally {
+    for (const p of busy) p.kill('SIGKILL');
+  }
+});
+
+test('configured guard and disk globs match by the same bounded scan', () => {
   const slow = 'a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b', stem = 'a'.repeat(64);
   const guarded = repo({ 'README.md': 'x\n' }, { allow: [{ path: slow, reason: 'fixture' }] });
   const input = JSON.stringify({ cwd: guarded, tool_name: 'Write', tool_input: { file_path: join(guarded, `${stem}.log`) } });
   const guard = check(guarded, ['--guard'], input, CLI_LIMIT);
   assert.ifError(guard.error);
-  assert.equal(guard.status, 1, guard.stderr);
-  assert.match(guard.stderr, /path glob matching exceeded 100 ms/);
+  assert.doesNotMatch(guard.stderr, /matching exceeded/);
   const disk = repo({ 'README.md': 'x\n', '.gitignore': '*.tmp\n' }, { keep: [{ path: slow, reason: 'fixture' }] });
   writeFileSync(join(disk, `${stem}.tmp`), 'x\n');
   const r = check(disk, ['--disk'], undefined, CLI_LIMIT);
   assert.ifError(r.error);
-  assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stderr, /path glob matching exceeded 100 ms/);
+  assert.doesNotMatch(r.stderr, /matching exceeded/);
 });
 
 test('turn hooks hash symlink text without reading the outside file or a FIFO target', t => {

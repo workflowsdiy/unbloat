@@ -96,18 +96,6 @@ function git(cwd, args, input) {
   return r.stdout;
 }
 
-function glob(pattern, flags = 'i') {
-  let re = '';
-  for (let i = 0; i < pattern.length; i++) {
-    const c = pattern[i];
-    if (c === '*' && pattern[i + 1] === '*') {
-      if (pattern[i + 2] === '/') { re += '(?:[\\s\\S]*/)?'; i += 2; } else { re += '[\\s\\S]*'; i += 1; }
-    } else if (c === '*') re += '[^/]*';
-    else if (c === '?') re += '[^/]';
-    else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(`^${re}$`, flags);
-}
 // Only this fixed expression runs in the VM; repository patterns remain data.
 const patternTest = new Script('patterns.some(re => re.test(value))');
 function boundedMatch(label) {
@@ -123,10 +111,37 @@ function boundedMatch(label) {
     }
   };
 }
-const matcher = (patterns, flags, bounded = false) => {
-  const res = patterns.map(p => glob(p, flags));
-  const test = bounded && res.length ? boundedMatch('path glob') : null;
-  return path => test ? test(path, res) : res.some(r => r.test(path));
+// Repository globs are matched without a regex: a pass over the path per pattern token, so the work is bounded by
+// pattern length times path length and no pattern can stall the check, however loaded the machine.
+function globTokens(pattern) {
+  const tokens = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*' && pattern[i + 1] === '*') {
+      if (pattern[i + 2] === '/') { tokens.push({ kind: 'dirs' }); i += 2; } else { tokens.push({ kind: 'any' }); i += 1; }
+    } else if (c === '*') tokens.push({ kind: 'star' });
+    else if (c === '?') tokens.push({ kind: 'one' });
+    else tokens.push({ kind: 'lit', c });
+  }
+  return tokens;
+}
+function globMatch(tokens, path, fold) {
+  const n = path.length, text = fold ? path.toLowerCase() : path;
+  let at = new Uint8Array(n + 1); at[0] = 1;
+  for (const t of tokens) {
+    const next = new Uint8Array(n + 1);
+    if (t.kind === 'lit') { const c = fold ? t.c.toLowerCase() : t.c; for (let p = 0; p < n; p++) if (at[p] && text[p] === c) next[p + 1] = 1; }
+    else if (t.kind === 'one') { for (let p = 0; p < n; p++) if (at[p] && text[p] !== '/') next[p + 1] = 1; }
+    else if (t.kind === 'star') { let open = false; for (let p = 0; p <= n; p++) { if (at[p]) open = true; if (open) next[p] = 1; if (p < n && text[p] === '/') open = false; } }
+    else if (t.kind === 'any') { let open = false; for (let p = 0; p <= n; p++) { if (at[p]) open = true; if (open) next[p] = 1; } }
+    else { let open = false; for (let p = 0; p <= n; p++) { if (at[p]) { next[p] = 1; open = true; } if (open && p > 0 && text[p - 1] === '/') next[p] = 1; } }
+    at = next;
+  }
+  return at[n] === 1;
+}
+const matcher = (patterns, flags = 'i') => {
+  const fold = flags.includes('i'), compiled = patterns.map(globTokens);
+  return path => compiled.some(t => globMatch(t, path, fold));
 };
 const processDoc = matcher(PROCESS_DOCS);
 const processName = ((names, folders) => path => (names(path) && RECORD_EXT.test(path)) || (folders(path) && NOTE_EXT.test(path)))(
@@ -261,12 +276,12 @@ function check(files, config) {
   const problems = [];
   const add = (path, line, text) => problems.push({ path, line, text });
   exceptionProblems(config, add);
-  const allowed = matcher(globs(config, 'allow'), 'i', true), licence = matcher(LICENCES, '');
+  const allowed = matcher(globs(config, 'allow'), 'i'), licence = matcher(LICENCES, '');
   const skipped = (m => path => licence(path) || m(path))(matcher([...SKIP, ...globs(config, 'skip')], 'i', config.skip.length > 0));
-  const dupSkipped = matcher(globs(config, 'dupSkip'), 'i', true), large = matcher(globs(config, 'allowLarge'), 'i', true);
+  const dupSkipped = matcher(globs(config, 'dupSkip'), 'i'), large = matcher(globs(config, 'allowLarge'), 'i');
   const recordFile = matcher(RECORD_FILES), instruction = matcher(INSTRUCTIONS, '');
   const waivers = config.allowPhrases.filter(w => w && typeof w.pattern === 'string')
-    .map(w => ({ re: new RegExp(w.pattern, 'i'), paths: matcher(w.paths ?? ['**'], 'i', true) }));
+    .map(w => ({ re: new RegExp(w.pattern, 'i'), paths: matcher(w.paths ?? ['**'], 'i') }));
   const waiverTest = boundedMatch('allowPhrases');
   const waived = (path, line) => waiverTest(line, waivers.filter(w => w.paths(path)).map(w => w.re));
   const dirs = new Set();
@@ -564,8 +579,8 @@ function guard(input) {
     let config;
     try { config = loadConfig(readConfig(root), CONFIG); } catch { config = loadConfig('{}', CONFIG); } // allow nothing
     const rel = relative(root, abs).split('\\').join('/');
-    if (processDoc(rel) || (processName(rel) && !matcher(globs(config, 'allow'), 'i', true)(rel))) reason = `unbloat-check: ${rel} is a process file: ${WHY_FILE}.`;
-    else if (matcher(RECORD_FILES)(rel) && !matcher(globs(config, 'allow'), 'i', true)(rel)) reason = `unbloat-check: ${rel} looks like a run record: ${WHY_FILE}.`;
+    if (processDoc(rel) || (processName(rel) && !matcher(globs(config, 'allow'), 'i')(rel))) reason = `unbloat-check: ${rel} is a process file: ${WHY_FILE}.`;
+    else if (matcher(RECORD_FILES)(rel) && !matcher(globs(config, 'allow'), 'i')(rel)) reason = `unbloat-check: ${rel} looks like a run record: ${WHY_FILE}.`;
   }
   if (reason) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }));
   return 0;
@@ -745,7 +760,7 @@ function disk(root) {
   const kept = config.keep.filter(e => e && typeof e.path === 'string').map(e => {
     const path = !/[*?]/.test(e.path) && !e.path.endsWith('/') && lstatSync(join(root, e.path), { throwIfNoEntry: false })?.isDirectory()
       ? `${e.path}/` : e.path;
-    return { ...e, path, is: matcher([path], 'i', true) };
+    return { ...e, path, is: matcher([path], 'i') };
   });
   const keepOf = rel => kept.find(k => k.is(rel));
   const keep = rel => env(rel) || keepOf(rel) !== undefined;
