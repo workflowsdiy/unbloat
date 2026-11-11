@@ -4,7 +4,7 @@
 // Usage is in ../references/check.md.
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, posix, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -547,9 +547,9 @@ function guard(input) {
   const cwd = call.cwd ?? process.cwd();
   const targets = [];
   let reason = null;
-  if (['Write', 'NotebookEdit'].includes(tool)) targets.push(args.file_path ?? args.notebook_path);
+  if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) targets.push(args.file_path ?? args.notebook_path);
   if (tool === 'apply_patch') {
-    for (const m of String(args.command ?? args.patch ?? '').matchAll(/^\*\*\* (?:Add File|Move to): (.+)$/gm)) targets.push(m[1].trim());
+    for (const m of String(args.command ?? args.patch ?? '').matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+)$/gm)) targets.push(m[1].trim());
   }
   if (tool === 'Bash' || tool === 'PowerShell') {
     // The guard reads common forms; the pre-commit hook and the end-of-turn gate catch whatever it misses.
@@ -583,7 +583,21 @@ function guard(input) {
     else if (matcher(RECORD_FILES)(rel) && !matcher(globs(config, 'allow'), 'i')(rel)) reason = `unbloat-check: ${rel} looks like a run record: ${WHY_FILE}.`;
   }
   if (reason) console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }));
+  else claimWrites(cwd, call.session_id ?? '', targets);
   return 0;
+}
+// Records, in the session's own claims file, each file an allowed call writes, so the end-of-turn gate knows which
+// changes in the checkout are this session's (see stop). Only a session with a turn in progress claims anything.
+function claimWrites(cwd, session, targets) {
+  for (const raw of targets.filter(Boolean)) {
+    if (raw.includes('$')) continue; // a shell variable this guard cannot resolve
+    const abs = resolve(cwd, raw.replace(/^(?:~|\$HOME|\$\{HOME\})(?=\/|$)/, homedir()));
+    const root = repoRoot(dirname(abs));
+    if (!root || !configOf(root)) continue;
+    const turn = readTurn(root, session);
+    if (!turn?.active) continue;
+    appendFileSync(claimsFile(root, session), `${relative(root, abs).split('\\').join('/')}\0`);
+  }
 }
 // A shell command as segments of words, split at ; & | && || ( ) and newlines. Adjacent quoted and plain pieces
 // join into one word (PL''AN.md is PLAN.md); a word with any quoted piece is marked quoted. Heredoc bodies are
@@ -685,11 +699,38 @@ function sessionStart(input) {
 // in the repository's git folder, never its tree.
 const MAX_SENDS = 2;
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
-// One record per agent session (the hook's session_id), so sessions in one repository don't share a turn.
-const turnFile = (root, session) => resolve(root, git(root, ['rev-parse', '--git-path',
-  `unbloat-turn${session ? `-${String(session).replace(/[^\w-]/g, '_')}` : ''}.json`]).toString().trim());
+// One record per agent session (the hook's session_id), so sessions in one repository don't share a turn. Each
+// session also has a claims file: the paths its own allowed writes touched this turn, NUL-separated (see claimWrites).
+const sessionSuffix = session => (session ? `-${createHash('sha256').update(String(session)).digest('hex').slice(0, 24)}` : '');
+// Written whole under a temporary name and renamed into place, so a reader in another session never sees half of it.
+const publish = (file, text) => { const tmp = `${file}.${process.pid}.tmp`; writeFileSync(tmp, text); renameSync(tmp, file); };
+// A session's claims count against other sessions only while they are recent: a turn that stopped without its Stop
+// hook (a killed session) then stops excluding anything, so its files are counted again.
+const CLAIM_WINDOW_MS = 2 * 60 * 60 * 1000;
+const gitFile = (root, name) => resolve(root, git(root, ['rev-parse', '--git-path', name]).toString().trim());
+const turnFile = (root, session) => gitFile(root, `unbloat-turn${sessionSuffix(session)}.json`);
+const claimsFile = (root, session) => gitFile(root, `unbloat-claims${sessionSuffix(session)}.txt`);
+const readTurn = (root, session) => { try { return JSON.parse(readFileSync(turnFile(root, session), 'utf8')); } catch { return null; } };
 const hookSession = input => { try { return JSON.parse(input || '{}').session_id ?? ''; } catch { return ''; } };
 const zpaths = buf => buf.toString().split('\0').filter(Boolean);
+const readClaims = file => { try { return zpaths(readFileSync(file)); } catch { return []; } };
+// Paths that other sessions have claimed in a turn still in progress. A session's own writes are its own: another
+// session's commit of them is not this session's change.
+function othersClaimed(root, session) {
+  const dir = dirname(turnFile(root, session));
+  const own = basename(turnFile(root, session));
+  const claimed = new Set();
+  for (const name of readdirSync(dir)) {
+    const m = /^unbloat-turn(-[\w-]+)?\.json$/.exec(name);
+    if (!m || name === own) continue;
+    const turn = (() => { try { return JSON.parse(readFileSync(join(dir, name), 'utf8')); } catch { return null; } })();
+    if (!turn?.active) continue;
+    const claims = join(dir, `unbloat-claims${m[1] ?? ''}.txt`);
+    try { if (Date.now() - statSync(claims).mtimeMs > CLAIM_WINDOW_MS) continue; } catch { continue; }
+    for (const p of readClaims(claims)) claimed.add(p);
+  }
+  return claimed;
+}
 // Git's object id for a file's bytes. Hashed here, not by git hash-object: that would run the repository's clean
 // filters, and its stdin list breaks on a newline in a file name.
 const blobId = buf => createHash('sha1').update(`blob ${buf.length}\0`).update(buf).digest('hex');
@@ -707,46 +748,59 @@ function turnStart(input) {
   if (!root || !configOf(root)) return 0;
   let dirty = {};
   try { dirty = head(root) ? dirtyNow(root) : {}; } catch { /* unusual paths: count everything as the turn's */ }
-  writeFileSync(turnFile(root, hookSession(input)), JSON.stringify({ base: head(root), sends: 0, dirty }) + '\n');
+  // The old claims go first: a reader that sees the new active record then never sees the old turn's claims.
+  publish(claimsFile(root, hookSession(input)), '');
+  publish(turnFile(root, hookSession(input)), JSON.stringify({ base: head(root), sends: 0, dirty, active: true }) + '\n');
   return 0;
 }
 
 function stop(input) {
   const root = repoRoot(hookCwd(input));
   if (!root || !configOf(root)) return 0;
-  const record = turnFile(root, hookSession(input));
-  let turn = { base: null, sends: 0, dirty: {} };
+  const session = hookSession(input);
+  const record = turnFile(root, session);
+  let turn = { base: null, sends: 0, dirty: {}, active: false };
   let recorded = false;
   try { turn = { ...turn, ...JSON.parse(readFileSync(record, 'utf8')) }; recorded = true; } catch { /* no record: changes since HEAD */ }
-  if (turn.sends >= MAX_SENDS) return 0;
-  // Every block counts as a send, including a broken config, so a turn can't be held open forever.
-  const send = reason => {
-    writeFileSync(record, JSON.stringify({ ...turn, sends: turn.sends + 1 }) + '\n');
-    console.log(JSON.stringify({ decision: 'block', reason }));
+  const reason = turn.sends >= MAX_SENDS ? null : blockReason(root, session, turn, recorded);
+  // The turn stays active while this check runs, and after a block until the agent's next stop, so other sessions
+  // keep excluding only what this turn did not write. Every block counts as a send: a turn can't be held open forever.
+  if (reason === null) {
+    if (recorded) publish(record, JSON.stringify({ ...turn, active: false }) + '\n');
     return 0;
-  };
+  }
+  publish(record, JSON.stringify({ ...turn, sends: turn.sends + 1, active: true }) + '\n');
+  console.log(JSON.stringify({ decision: 'block', reason }));
+  return 0;
+}
+
+// What this turn's changes still get wrong: the message to send back, or null when there is nothing to fix.
+function blockReason(root, session, turn, recorded) {
   // A turn that began before the first commit counts everything it committed: diff from the empty tree.
   const base = turn.base ?? (recorded ? EMPTY_TREE : head(root));
   const now = (() => { try { return head(root) ? dirtyNow(root) : {}; } catch { return {}; } })();
-  // Paths that were already changed when the turn began, and still hold the same content, aren't this turn's.
+  // The checkout's changes, minus those another session claimed (its own writes, not this turn's). Paths
+  // that were already changed when the turn began, and still hold the same content, aren't this turn's either.
+  const own = new Set(readClaims(claimsFile(root, session)));
+  const others = othersClaimed(root, session);
   const changed = new Set([
     ...(base ? zpaths(git(root, ['diff', '-z', '--name-only', base])) : []),
     ...zpaths(git(root, ['ls-files', '-z', '--others', '--exclude-standard'])),
-  ].filter(p => !(p in turn.dirty) || turn.dirty[p] !== now[p]));
-  if (changed.size === 0) return 0;
+  ].filter(p => (!(p in turn.dirty) || turn.dirty[p] !== now[p]) && (own.has(p) || !others.has(p))));
+  if (changed.size === 0) return null;
   let config;
   try { config = loadConfig(readConfig(root), CONFIG); } catch (e) {
-    return send(`unbloat-check: ${e.message}. Fix the config before you finish.`);
+    return `unbloat-check: ${e.message}. Fix the config before you finish.`;
   }
   const { problems } = check(readTree(root), config);
   // Problems in what the turn touched, and the config's own (budgets, exceptions): both fail the next commit.
   // A repeated sentence is reported at its first place, so the copies it names count too.
   const mine = problems.filter(p => p.path === CONFIG || changed.has(p.path) || [...changed].some(c => p.text.includes(` ${c}:`)));
-  if (mine.length === 0) return 0;
+  if (mine.length === 0) return null;
   const list = mine.slice(0, 20).map(p => `- ${p.path}${p.line ? `:${p.line}` : ''}: ${p.text}`).join('\n');
   const more = mine.length > 20 ? `\n- and ${mine.length - 20} more (run unbloat-check)` : '';
-  return send(`unbloat-check: what this turn changed in ${root} has ${mine.length} problem(s) the next commit would ` +
-    `fail on. Fix them before you finish; an exception is only for product files or wording, with its reason.\n${list}${more}`);
+  return `unbloat-check: what this turn changed in ${root} has ${mine.length} problem(s) the next commit would ` +
+    `fail on. Fix them before you finish; an exception is only for product files or wording, with its reason.\n${list}${more}`;
 }
 
 // Ignored and untracked build-up: caches, scratch and output folders, by size and age. Reports; never deletes.

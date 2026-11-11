@@ -1,7 +1,8 @@
 // node --test: unbloat-check against throwaway git repositories.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { availableParallelism, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -11,6 +12,8 @@ const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'skills', 'un
 const check = (cwd, args = [], input, options = {}) => spawnSync(process.execPath, [SCRIPT, ...args], { cwd, input, encoding: 'utf8', ...options });
 const git = (cwd, ...args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
 const CLI_LIMIT = { timeout: 2000, killSignal: 'SIGKILL' };
+// The turn record the hooks keep for a session (its file name is the hash of the session id; see the script).
+const turnRecord = (dir, session) => join(dir, '.git', `unbloat-turn-${createHash('sha256').update(session).digest('hex').slice(0, 24)}.json`);
 
 // Every temporary folder the suite makes is removed when it ends.
 const temps = [];
@@ -301,6 +304,121 @@ test('each agent session keeps its own turn record', () => {
   hook('--turn-start', 'b'); // b starts after a wrote PLAN.md
   assert.equal(hook('--stop', 'b'), '');
   assert.equal(JSON.parse(hook('--stop', 'a')).decision, 'block');
+});
+
+test('a commit another session made during this turn is not this turn\'s change', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-q', '-m', 'start').status, 0);
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session }));
+  const guard = (session, call) => check(dir, ['--guard'], JSON.stringify({ cwd: dir, session_id: session, ...call }));
+  hook('--turn-start', 'a');
+  hook('--turn-start', 'b');
+  const allowed = guard('b', { tool_name: 'Write', tool_input: { file_path: join(dir, 'docs.md') } });
+  assert.equal(allowed.status, 0, allowed.stderr);
+  assert.equal(allowed.stdout, ''); // allowed, and recorded as b's
+  writeFileSync(join(dir, 'docs.md'), 'It renders pages after the review.\n');
+  assert.equal(git(dir, 'add', '-A').status, 0);
+  assert.equal(git(dir, 'commit', '-q', '-m', 'b: docs').status, 0);
+  const a = hook('--stop', 'a');
+  assert.equal(a.status, 0, a.stderr);
+  assert.equal(a.stdout, ''); // a made no change: b's commit is not a's
+  const b = hook('--stop', 'b');
+  assert.equal(b.status, 0, b.stderr);
+  assert.equal(JSON.parse(b.stdout).decision, 'block'); // b's own change still counts
+});
+
+test('while another session is mid-turn, each session still answers for its own files, including a file both wrote', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-q', '-m', 'start').status, 0);
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session }));
+  const guard = (session, file) => check(dir, ['--guard'], JSON.stringify({ cwd: dir, session_id: session, tool_name: 'Write', tool_input: { file_path: join(dir, file) } }));
+  hook('--turn-start', 'a');
+  hook('--turn-start', 'b');
+  for (const [session, file] of [['a', 'docs-a.md'], ['b', 'docs-b.md'], ['a', 'shared.md'], ['b', 'shared.md']]) {
+    assert.equal(guard(session, file).status, 0);
+  }
+  const problem = 'It renders pages after the review.\n';
+  for (const file of ['docs-a.md', 'docs-b.md', 'shared.md']) writeFileSync(join(dir, file), problem);
+  const a = hook('--stop', 'a');
+  assert.equal(a.status, 0, a.stderr);
+  const sentA = JSON.parse(a.stdout).reason;
+  assert.match(sentA, /docs-a\.md:1:/);
+  assert.match(sentA, /shared\.md:1:/);
+  assert.doesNotMatch(sentA, /docs-b\.md/); // b's file, and b is still mid-turn
+  const b = hook('--stop', 'b');
+  assert.equal(b.status, 0, b.stderr);
+  const sentB = JSON.parse(b.stdout).reason;
+  assert.match(sentB, /docs-b\.md:1:/);
+  assert.match(sentB, /shared\.md:1:/);
+  assert.doesNotMatch(sentB, /docs-a\.md/);
+});
+
+test('a session that stopped without its Stop hook stops excluding its claims after the claim window', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-q', '-m', 'start').status, 0);
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session }));
+  hook('--turn-start', 'a');
+  hook('--turn-start', 'b');
+  assert.equal(check(dir, ['--guard'], JSON.stringify({ cwd: dir, session_id: 'b', tool_name: 'Write', tool_input: { file_path: join(dir, 'left.md') } })).status, 0);
+  writeFileSync(join(dir, 'left.md'), 'It renders pages after the review.\n'); // b never reaches its Stop
+  assert.equal(hook('--stop', 'a').stdout, ''); // b's claim is recent: a does not answer for it
+  const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  utimesSync(turnRecord(dir, 'b').replace(/\.json$/, '.txt').replace('unbloat-turn-', 'unbloat-claims-'), old, old);
+  const a = hook('--stop', 'a');
+  assert.equal(a.status, 0, a.stderr);
+  assert.match(JSON.parse(a.stdout).reason, /left\.md:1:/); // an old claim no longer excludes it
+});
+
+test('session ids that differ only in punctuation keep separate records and claims', () => {
+  const dir = repo({ 'README.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-q', '-m', 'start').status, 0);
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session }));
+  hook('--turn-start', 'a.b');
+  assert.equal(check(dir, ['--guard'], JSON.stringify({ cwd: dir, session_id: 'a.b', tool_name: 'Write', tool_input: { file_path: join(dir, 'mine.md') } })).status, 0);
+  hook('--turn-start', 'a_b'); // must not clear a.b's claims
+  writeFileSync(join(dir, 'mine.md'), 'It renders pages after the review.\n');
+  const other = hook('--stop', 'a_b');
+  assert.equal(other.status, 0, other.stderr);
+  assert.equal(other.stdout, ''); // a_b did not write mine.md
+  const own = hook('--stop', 'a.b');
+  assert.equal(own.status, 0, own.stderr);
+  assert.match(JSON.parse(own.stdout).reason, /mine\.md:1:/);
+});
+
+test('the plugin wires the guard and the turn hooks to the script, with the arguments the gate needs', () => {
+  const wired = JSON.parse(readFileSync(join(dirname(SCRIPT), '..', '..', '..', 'hooks', 'hooks.json'), 'utf8')).hooks;
+  const pre = wired.PreToolUse[0];
+  const tools = pre.matcher.split('|');
+  for (const tool of ['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Bash', 'PowerShell']) assert.ok(tools.includes(tool), tool);
+  const command = (hooks) => { assert.equal(hooks[0].type, 'command'); return hooks[0].command; };
+  assert.match(command(pre.hooks), /unbloat-check\.mjs" --guard$/);
+  assert.match(command(wired.UserPromptSubmit[0].hooks), /unbloat-check\.mjs" --turn-start$/);
+  assert.match(command(wired.Stop[0].hooks), /unbloat-check\.mjs" --stop$/);
+});
+
+test('the guard records each file a session writes, through Edit, apply_patch and shell redirection', () => {
+  const dir = repo({ 'README.md': 'x\n', 'tool.md': 'x\n' });
+  assert.equal(git(dir, 'commit', '-q', '-m', 'start').status, 0);
+  const hook = (flag, session) => check(dir, [flag], JSON.stringify({ cwd: dir, session_id: session }));
+  const guard = (session, call) => check(dir, ['--guard'], JSON.stringify({ cwd: dir, session_id: session, ...call }));
+  hook('--turn-start', 'a');
+  hook('--turn-start', 'b');
+  for (const call of [
+    { tool_name: 'Edit', tool_input: { file_path: join(dir, 'README.md') } },
+    { tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Update File: tool.md\n@@\n-x\n+y\n*** End Patch' } },
+    { tool_name: 'Bash', tool_input: { command: 'echo "It renders pages after the review." > notes.md' } },
+  ]) assert.equal(guard('b', call).status, 0);
+  for (const file of ['README.md', 'tool.md', 'notes.md']) writeFileSync(join(dir, file), 'It renders pages after the review.\n');
+  assert.equal(git(dir, 'add', '-A').status, 0);
+  assert.equal(git(dir, 'commit', '-q', '-m', 'b: three files').status, 0);
+  const a = hook('--stop', 'a');
+  assert.equal(a.status, 0, a.stderr);
+  assert.equal(a.stdout, ''); // a's stop sees none of b's files
+  const b = hook('--stop', 'b');
+  assert.equal(b.status, 0, b.stderr);
+  const sent = JSON.parse(b.stdout);
+  assert.equal(sent.decision, 'block');
+  for (const file of ['README.md', 'tool.md', 'notes.md']) assert.match(sent.reason, new RegExp(`${file.replace('.', '\\.')}:1:`));
 });
 
 test('--staged takes the config from the index', () => {
@@ -756,7 +874,7 @@ test('turn hooks hash symlink text without reading the outside file or a FIFO ta
   const started = check(dir, ['--turn-start'], input, CLI_LIMIT);
   assert.ifError(started.error);
   assert.equal(started.status, 0, started.stderr);
-  const record = () => JSON.parse(readFileSync(join(dir, '.git/unbloat-turn-link-read.json'), 'utf8'));
+  const record = () => JSON.parse(readFileSync(turnRecord(dir, 'link-read'), 'utf8'));
   assert.equal(record().dirty['linked.txt'], expected.stdout.trim());
   writeFileSync(target, 'changed outside content\n');
   const stopped = check(dir, ['--stop'], input, CLI_LIMIT);
@@ -787,7 +905,7 @@ test('turn hooks skip tracked paths whose parent directory became a symlink', t 
   const r = check(dir, ['--turn-start'], input, CLI_LIMIT);
   assert.ifError(r.error);
   assert.equal(r.status, 0, r.stderr);
-  const state = JSON.parse(readFileSync(join(dir, '.git/unbloat-turn-parent-link.json'), 'utf8'));
+  const state = JSON.parse(readFileSync(turnRecord(dir, 'parent-link'), 'utf8'));
   assert.equal(state.dirty['docs/notes.txt'], '');
   const stopped = check(dir, ['--stop'], input, CLI_LIMIT);
   assert.ifError(stopped.error);

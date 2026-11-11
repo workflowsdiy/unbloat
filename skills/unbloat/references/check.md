@@ -70,10 +70,10 @@ hook in an opted-in repository that has no pre-commit hook yet; a project's own 
 
 ## The end-of-turn gate
 
-`--turn-start` (on `UserPromptSubmit`) records the commit a turn starts from. `--stop` (on `Stop`) checks what
-the turn changed (commits, edits and new files) and, if that brought problems the next commit would fail on,
-sends the agent back to fix them before it finishes, at most twice a turn. The record lives in the repository's
-Git folder, never its tree.
+`--turn-start` (on `UserPromptSubmit`) records the commit a turn starts from. `--stop` (on `Stop`) sends back, at
+most twice a turn, the problems the turn brought: commits, edits and new files, minus files another session with a recent
+turn in progress wrote (the guard on `PreToolUse` records each session's writes). Codex's guard sees only
+`apply_patch` and Bash. The record lives in the repository's Git folder, never its tree.
 
 All four hooks do nothing outside an opted-in repository, and each agent session keeps its own turn record.
 The Claude Code plugin wires them up in `hooks/hooks.json`. For Codex, add them to `~/.codex/hooks.json`, with
